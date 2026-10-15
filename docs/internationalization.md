@@ -15,8 +15,8 @@ user-defined names, or the locale environment inherited by other programs.
 - `data/locales/dates.json`: month/weekday names and date presentation patterns,
   also multilingual. ISO 8601 remains language-independent.
 
-Locales are `en`, `fr`, `de`, `es`, `ja`, `pt-BR`, `ko`, `vi`, `it`, `ru`, and
-`zh-CN`.
+Locales are `en`, `fr`, `de`, `es`, `ja`, `pt-BR`, `ko`, `vi`, `it`, `ru`,
+`zh-CN`, and `zh-TW`.
 JSON keys normally contain the original English message. Semantic keys are used
 for grammatical count forms and calendar data, and for an English word that needs
 a different translation in one context. Those context keys are prefixed with their
@@ -58,7 +58,7 @@ no-break space (U+00A0) inside « » and before ":", and a narrow no-break space
 word. Japanese values use the ASCII colon (": " mid-line, ":" at the end of a
 line), never "：", so nested templates such as `%{name}: %{error}` never mix
 styles. Quote names inserted into a sentence with the language's quotation marks
-(en “…”, de „…“, fr « … », ru «…», ja 「…」, zh-CN “…”, and the style each
+(en “…”, de „…“, fr « … », ru «…», ja 「…」, zh-CN “…”, zh-TW 「…」, and the style each
 other catalog already uses), never Markdown backticks.
 
 Simplified Chinese values read like Chinese desktop software, such as File
@@ -76,6 +76,18 @@ classifier and the same text in every plural form, lists join with "、", and
 dates and durations put no space between digits and Han: "2026年9月7日",
 "1小时2分", "2分5秒", and "45秒". Key names, unit symbols, and product names stay
 as in English.
+
+Traditional Chinese (`zh-TW`) follows the same structure, punctuation, spacing, count,
+list, date, and duration rules as Simplified Chinese, but uses Taiwan vocabulary and
+character forms, as in Windows, macOS, and GNOME Files in `zh_TW`, not characters
+converted one by one from `zh-CN`. Prefer 檔案 (not 文件) for files, 資料夾 for
+folders, 垃圾桶 for Trash, 磁碟機 for drives, 設定 (not 配置), 自訂, 影片, 資訊,
+軟體, 使用者, 預設, 網路, 儲存, 載入, 滑鼠, 套件 for packages, 指令 for commands,
+行程 for processes, 算繪 for rendering, 建置 for builds, 復原 for undo, 本機 for
+local, and 存取 for access; 文件 is a document or the Documents folder. Quote names and
+paths with 「…」 (『…』 inside them), never “…” or ASCII quotes. Counts use 個 or 項
+with the same text in every plural form, and dates and durations put no space between
+digits and Han: "2026年9月7日", "1小時2分", "2分5秒", and "45秒".
 
 Translate each string exactly once. The shared modal builders (`modal_layout`,
 `message_dialog_layout`) display their title, subtitle, and confirm label as given,
@@ -169,19 +181,21 @@ The following text is outside Strata's catalogs or deliberately English:
   when a background thread or helper fails internally.
 
 GTK uses Fontconfig fallback for characters absent from the selected font.
-Japanese, Korean, and Simplified Chinese require installed CJK fonts, such as
-Noto Sans CJK (commonly packaged as `noto-fonts-cjk` or `fonts-noto-cjk`);
-Simplified Chinese needs one with Simplified Chinese glyphs, such as Noto Sans
-CJK SC. Chinese and Japanese text share Han code points, whose regional glyph
+Japanese, Korean, Simplified Chinese, and Traditional Chinese require installed CJK
+fonts, such as Noto Sans CJK (commonly packaged as `noto-fonts-cjk` or
+`fonts-noto-cjk`); Simplified Chinese needs one with Simplified Chinese glyphs, such
+as Noto Sans CJK SC, and Traditional Chinese one with Traditional glyphs, such as
+Noto Sans CJK TC. Chinese and Japanese text share Han code points, whose regional glyph
 forms Pango chooses from the text language. GTK takes that language from the
 process locale (`LC_CTYPE`), not from Strata's language setting. If the locale is
 neither Chinese nor Japanese, Pango uses the first Chinese or Japanese entry in
 `PANGO_LANGUAGE` (or `LANGUAGE` when that is unset); without one, the forms are
-the defaults of whichever CJK font Fontconfig picks. A manual 简体中文 choice can
-therefore show Japanese, Korean, or Traditional forms, and auto-detected Chinese
-on a `zh_TW` or `zh_HK` locale uses that region's forms. To see Simplified forms
-on a locale that is neither Chinese nor Japanese, run Strata with
-`PANGO_LANGUAGE=zh-cn`. Strata does not download or install fonts. A minimal
+the defaults of whichever CJK font Fontconfig picks. A manual 简体中文 or 繁體中文
+choice can therefore show Japanese, Korean, or the other Chinese script's forms,
+and auto-detected Chinese on a `zh_TW` or `zh_HK` locale uses that region's forms.
+To see Simplified or Taiwan Traditional forms on a locale that is neither Chinese
+nor Japanese, run Strata with `PANGO_LANGUAGE=zh-cn` or `PANGO_LANGUAGE=zh-tw`.
+Strata does not download or install fonts. A minimal
 container without CJK fonts can expose correct accessible text while rendering
 missing-glyph boxes; check actual rendering with suitable fonts installed, rather
 than relying only on accessibility tests.

@@ -29,13 +29,15 @@ pub(crate) enum Language {
     Russian,
     #[serde(rename = "zh-CN")]
     SimplifiedChinese,
+    #[serde(rename = "zh-TW")]
+    TraditionalChinese,
     #[default]
     #[serde(other, rename = "auto")]
     Auto,
 }
 
 impl Language {
-    pub const CHOICES: [(&'static str, Self); 12] = [
+    pub const CHOICES: [(&'static str, Self); 13] = [
         ("Auto-detect", Self::Auto),
         ("English", Self::English),
         ("Français", Self::French),
@@ -48,6 +50,7 @@ impl Language {
         ("Italiano", Self::Italian),
         ("Русский", Self::Russian),
         ("简体中文", Self::SimplifiedChinese),
+        ("繁體中文", Self::TraditionalChinese),
     ];
 
     pub fn locale(self) -> &'static str {
@@ -64,6 +67,7 @@ impl Language {
             Self::Italian => "it",
             Self::Russian => "ru",
             Self::SimplifiedChinese => "zh-CN",
+            Self::TraditionalChinese => "zh-TW",
         }
     }
 }
@@ -75,7 +79,8 @@ fn supported_locale(value: &str) -> Option<&'static str> {
         .next()?
         .replace('_', "-")
         .to_ascii_lowercase();
-    match value.split('-').next()? {
+    let mut parts = value.split('-');
+    match parts.next()? {
         "en" | "c" | "posix" => Some("en"),
         "fr" => Some("fr"),
         "de" => Some("de"),
@@ -86,7 +91,7 @@ fn supported_locale(value: &str) -> Option<&'static str> {
         "vi" => Some("vi"),
         "it" => Some("it"),
         "ru" => Some("ru"),
-        // Traditional Chinese locales also use the Simplified catalog.
+        "zh" if parts.any(|part| matches!(part, "tw" | "hk" | "mo" | "hant")) => Some("zh-TW"),
         "zh" => Some("zh-CN"),
         _ => None,
     }
@@ -215,7 +220,7 @@ fn list_in(locale: &str, items: impl IntoIterator<Item = String>) -> String {
 
 fn plural_category(locale: &str, count: u64) -> &'static str {
     match locale {
-        "ja" | "ko" | "vi" | "zh-CN" => "other",
+        "ja" | "ko" | "vi" | "zh-CN" | "zh-TW" => "other",
         "fr" | "pt-BR" if count <= 1 => "one",
         "ru" if count % 10 == 1 && count % 100 != 11 => "one",
         "ru" if (2..=4).contains(&(count % 10)) && !(12..=14).contains(&(count % 100)) => "few",
@@ -245,14 +250,14 @@ fn count_in(locale: &str, kind: &str, count: u64) -> String {
 
 fn decimal_separator(locale: &str) -> &'static str {
     match locale {
-        "en" | "ja" | "ko" | "zh-CN" => ".",
+        "en" | "ja" | "ko" | "zh-CN" | "zh-TW" => ".",
         _ => ",",
     }
 }
 
 fn group_separator(locale: &str) -> &'static str {
     match locale {
-        "en" | "ja" | "ko" | "zh-CN" => ",",
+        "en" | "ja" | "ko" | "zh-CN" | "zh-TW" => ",",
         "fr" => "\u{202f}",
         "ru" => "\u{a0}",
         _ => ".",

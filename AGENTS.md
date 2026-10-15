@@ -201,9 +201,9 @@ pass before merge.
 ## Internationalization
 
 - Every new or changed application-owned, user-facing string must be localized
-  with `rust-i18n` and added or updated in **all eleven supported languages in the
+  with `rust-i18n` and added or updated in **all twelve supported languages in the
   same change**: English, French, German, Spanish, Japanese, Brazilian Portuguese,
-  Korean, Vietnamese, Italian, Russian, and Simplified Chinese. This includes
+  Korean, Vietnamese, Italian, Russian, Simplified Chinese, and Traditional Chinese. This includes
   labels, buttons, menus, placeholders, tooltips, accessibility
   names/descriptions, dialogs, help text, errors, notifications, and
   status/progress messages.
