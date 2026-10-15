@@ -321,11 +321,12 @@ fn metadata_probe_retains_software_sandbox_limits_and_narrow_runtime_access() {
                 || argument == "/sys")
     );
     for architecture in ["x86_64-linux-gnu", "aarch64-linux-gnu"] {
-        for library in ["libblas.so.3", "liblapack.so.3"] {
+        for library in ["libblas.so.3", "liblapack.so.3", "libopenblas.so.0"] {
             let path = format!("/etc/alternatives/{library}-{architecture}");
             assert!(joined.contains(&format!("--ro-bind-try {path} {path}")));
         }
     }
+    assert!(joined.contains("--setenv OPENBLAS_NUM_THREADS 1"));
 }
 
 #[test]

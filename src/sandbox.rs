@@ -744,14 +744,17 @@ fn runtime_command(bwrap: &Path, needs_media_libraries: bool) -> Command {
         command.args(["--setenv", "GDK_PIXBUF_MODULE_FILE", loaders]);
     }
     if needs_media_libraries {
-        // Debian-family FFmpeg libraries resolve BLAS/LAPACK through these links.
+        // Debian-family FFmpeg libraries resolve BLAS/LAPACK and OpenBLAS through these links.
         // Expose only the runtime files, not the system alternatives directory.
         for architecture in ["x86_64-linux-gnu", "aarch64-linux-gnu"] {
-            for library in ["libblas.so.3", "liblapack.so.3"] {
+            for library in ["libblas.so.3", "liblapack.so.3", "libopenblas.so.0"] {
                 let path = format!("/etc/alternatives/{library}-{architecture}");
                 command.arg("--ro-bind-try").arg(&path).arg(&path);
             }
         }
+        // FFmpeg never uses BLAS, and one OpenBLAS thread per core exhausts the helper's
+        // address-space limit, stalling the decoder.
+        command.args(["--setenv", "OPENBLAS_NUM_THREADS", "1"]);
     }
     // Debian-family ImageMagick commands resolve through these links.
     for tool in ["magick", "convert"] {
