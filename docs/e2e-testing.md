@@ -141,7 +141,8 @@ the invoking user. Minimal generated passwd/group files provide the invoking
 UID/GID to D-Bus, so one published environment works across local user IDs without
 rebuilding it or mounting the host's account database.
 The image includes bubblewrap for sandboxed thumbnail decoding, FFmpeg/ffprobe,
-and GTK's GStreamer media backend with the base/good/libav plugins. Rust media
+GTK's GStreamer media backend with the base/good/libav plugins, and strace for
+the opt-in [main-thread I/O audit](#main-thread-io-audit). Rust media
 regressions exercise actual normalization, playback, and long-source duration
 limits rather than skipping when optional host tools are missing. These packages
 come from the dated Arch snapshot. The accessibility patch is test-only and does
@@ -162,6 +163,12 @@ environment change and requires reviewing the visual baselines.
 For explicit host-toolkit debugging only, `./scripts/e2e-native.sh` accepts
 `STRATA_BINARY` and `STRATA_E2E_VENV`. A native pass does not replace canonical
 `./scripts/e2e.sh` evidence when targeted or full E2E validation is required.
+
+Both runners build the application with `--features invariant-checks`, which
+turns on exact but slow consistency assertions (for example, the selection
+position cache against a full listing scan). `cargo test --all-features` enables
+the same feature; plain `cargo build` leaves it off so development builds keep
+their normal speed. A `STRATA_BINARY` built without it skips those checks.
 
 ### Shared environment for formatting, lint, and Rust tests
 
@@ -195,7 +202,9 @@ The Rust suite runs with `--all-targets --all-features --locked` inside private
 Xvfb, with `GTK_A11Y=none`, `NO_AT_BRIDGE=1`, and `STRATA_REQUIRE_GTK_TESTS=1`.
 The shared Xvfb server uses `-noreset` so consecutive test processes do not
 race a server reset when the last display client exits. GTK initialization
-failures cannot silently skip tests. Formatting, compiler,
+failures cannot silently skip tests. The container's `/tmp`, which holds `HOME` and
+the tests' temporary folders, is an executable tmpfs: copy tests need `O_TMPFILE`
+there, which an overlay `/tmp` may refuse. Formatting, compiler,
 lint, and test failures remain blocking. Lightweight policy/helper jobs retain
 their existing runners rather than downloading a large GUI image unnecessarily.
 
@@ -205,10 +214,10 @@ CI's **Quality build and lint** job runs formatting and Clippy, then compiles
 `cargo test --locked --all-targets --all-features --no-run` once. It exports only
 test executables and a plan, not Cargo caches. `scripts/quality_ci.py` collects
 each libtest inventory, including the explicitly ignored tests, and assigns every
-entry to one of two shards. Timing hints in `scripts/quality-durations.json`
+entry to one of four shards. Timing hints in `scripts/quality-durations.json`
 come from successful GTK child runs in
 [run 34560353003](https://github.com/lgse/strata/actions/runs/34560353003).
-Tests are balanced longest-first across both shards; unknown tests receive a
+Tests are balanced longest-first across the shards; unknown tests receive a
 one-second weight and always participate. Timing hints are not an allowlist.
 The deferred-scroll timing was refreshed to 1.32 seconds from
 [run 34811363582](https://github.com/lgse/strata/actions/runs/34811363582).
@@ -241,7 +250,7 @@ To reproduce the handoff locally using the same pinned container:
 
 ```bash
 STRATA_QUALITY_TASK=build ./scripts/quality.sh test
-for shard in 0 1; do
+for shard in 0 1 2 3; do
   STRATA_QUALITY_TASK=shard STRATA_QUALITY_SHARD="$shard" ./scripts/quality.sh test
 done
 python3 scripts/quality_ci.py verify
@@ -555,18 +564,100 @@ Each patch breaks a single critical workflow and maps to the scenario that
 hits the mutated line, not every test in that file: drop onto a folder,
 Ctrl+V paste, arrow-key selection, single-click activation, the appearance
 menu, filtered Space preview, filter-row updates, popover outside-wheel,
-and the long-name caret. The unmodified scenarios must pass first; only a failed
+held document scrollbars, and the long-name caret. The unmodified scenarios must pass first; only a failed
 scenario assertion in the mutated run counts as detection, not a
 startup/collection error or killed process. Logs and JUnit reports are
 saved in `target/e2e-mutations`. The script restores source changes
 afterwards. Run it after changing the harness, and when adding a scenario
 for a workflow that does not have a mutation yet.
 
+## Main-thread I/O audit
+
+Strata must not touch the disk on the GTK main thread (see
+[`docs/architecture.md`](architecture.md)). Runtime asserts catch calls that go
+through Strata's own seams; two opt-in tools catch the rest, including GLib and
+GTK internals and closes triggered by drops. Neither is a CI job: run them before
+pushing a change that moves work on or off the UI thread.
+
+`scripts/trace-main-io.py` runs an E2E selection (every scenario by default)
+through the canonical runner with each Strata launch wrapped in `strace`: the
+application, the portal backend and the second instances some scenarios start.
+Harness code that starts Strata goes through `harness.main_io.launch`. Only the
+initial thread, which runs GTK's main loop, is traced, so workers keep their
+normal timing:
+
+```bash
+./scripts/trace-main-io.py                                  # every scenario
+./scripts/trace-main-io.py tests/e2e/scenarios/test_trash.py
+./scripts/trace-main-io.py --stacks -k 'rename and not visual'
+./scripts/trace-main-io.py --analyze target/main-io/<run>   # classify again
+```
+
+Traces, each launch's log and the report go to `target/main-io/<run>/`. Each file
+call is classified by its path, after resolving descriptors and `*at` folders:
+
+- **user**: the scenario's fixture tree, `HOME`, the Trash, the user's
+  `gtksourceview-5` and `gstreamer-1.0` folders, `/tmp`, `/run/media`, `/media`,
+  `/mnt` and GVfs mounts. Always a violation.
+- **settings**: Strata's own settings, state, caches and runtime files (`strata`
+  under the XDG folders, the shared thumbnail cache, GTK bookmarks, portal files,
+  Omarchy's theme state and Strata's install folder). A violation unless a
+  documented exception below covers it.
+- **toolkit**: system paths and the toolkit's own files (fonts, icons, Mesa,
+  audio configuration, GTK settings, MIME associations, recently
+  used files, the rest of `XDG_RUNTIME_DIR`, the launch's `XDG_DATA_DIRS`, pipes,
+  sockets and event descriptors). Ignored.
+- **unclassified**: anything else, reported so new paths get a deliberate
+  category.
+
+A metadata call (`stat`, `access`, `readlink`) on a folder above a settings or
+toolkit place takes that place's category, because path walks and `mkdir -p`
+stat every ancestor; the XDG folders themselves belong to the toolkit. Each call
+is a read, a write or, for `inotify_add_watch`, a watch, so no read exception
+covers a file monitor. The phase is startup until the harness sees the first
+window (the chooser for the portal backend), then running. The script exits
+non-zero when it finds a violation. `tests/e2e/main-io-allowlist.toml` holds
+only documented exceptions, each with its reason; the script refuses entries for
+user paths. The documented exceptions are:
+
+- Strata's reads of its settings and state at startup, which stay synchronous.
+- The bundled font, which Strata writes at startup and fontconfig reads whenever
+  it lays out text.
+- GIO's checks of an application's program while it lists or launches
+  applications (`GDesktopAppInfo`), a toolkit exception.
+
+`--stacks` adds the Strata frames of every reported call, named from the binary's
+symbol table; it leaves plain `read` and `write` untraced and is slow, so use it
+on a selection.
+
+Limits: page faults on mapped files and waits on another thread, such as a
+synchronous D-Bus call or a mutex held by a worker, make no traced call. The stall
+watchdog covers those. Set `STRATA_UI_STALL_MS` (for example `250`) to start a
+thread that posts to the main context every 100 ms; when the main loop has not run
+it within the limit, Strata logs the call the UI thread is blocked in, read from
+`/proc`:
+
+```text
+UI thread stalled 250 ms in openat("/mnt/nas/folder") wchan=…
+UI thread ran again after 2400 ms
+```
+
+The watchdog is off unless the variable is set. The E2E runner forwards it to
+every Strata launch, and `--stall-ms` passes it to an audit run, whose report
+lists the logged stalls per scenario. Debug builds stall at start-up while the
+first window is built, and more so under `strace`.
+
 ## In CI
+
+The E2E suite does not run on pull requests or pushes. Run it on demand from
+**Actions → E2E → Run workflow**, choosing the branch to test, or with
+`gh workflow run e2e.yml --ref <branch>`. Enable
+`require_published_environments` to bypass the fast dependency cache and require
+verified published base images.
 
 ### Three-minute critical path
 
-`.github/workflows/ci.yml` has three E2E stages:
+`.github/workflows/e2e.yml` has three E2E stages:
 
 1. **E2E build and plan** restores BuildKit layers for the pinned native/Python
    dependencies, Rust toolchain, and compiled `Cargo.lock` dependencies. It
@@ -580,7 +671,7 @@ for a workflow that does not have a mutation yet.
    xdist workers. Shards do not start BuildKit, contact a registry, restore Cargo
    caches, compile, or install packages. Every runner uses
    the same pinned rendering packages and baselines as a local canonical run.
-3. **End-to-end GUI suite** retains the existing required-check name. It requires
+3. **End-to-end GUI suite** aggregates the run. It requires
    every dependency to succeed, verifies that all planned node IDs passed setup,
    call, and teardown exactly once. Timing is **informational**, with a three-minute
    performance target—not a pass/fail condition. From build-job creation through
@@ -652,8 +743,8 @@ checksum, and plan checksum. The runtime image's input label must match too; it 
 by an arbitrary host binary or an artifact from another run.
 
 `Warm E2E dependencies` publishes the full dependency cache in a separate workflow,
-with a 30-minute bootstrap allowance: daily, on image/dependency changes on main
-and PRs, and on manual dispatch. PRs warm only their own branch-scoped cache.
+with a 30-minute bootstrap allowance: daily, on image/dependency changes on main,
+and on manual dispatch. Dispatch it on a branch to warm that branch's cache.
 The timed build restores a BuildKit local-cache directory through the cache action's
 segmented transfer path, keyed by image inputs, manifests, ignore rules, and UID/GID.
 BuildKit still validates content-addressed dependency records before reusing them.
@@ -778,7 +869,7 @@ To collect the current inventory inside the canonical container:
 ```
 
 For the exact CI binary, use a disposable checkout at the commit in its metadata
-(a PR normally tests the merge commit). Download `e2e-bundle-<attempt>` into
+(the head of the dispatched branch). Download `e2e-bundle-<attempt>` into
 `target/e2e-bundle`, build the `runtime` target with the invoking UID/GID, and run
 (use `docker` instead of `podman` if appropriate):
 

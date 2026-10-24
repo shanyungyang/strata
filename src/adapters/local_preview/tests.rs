@@ -132,6 +132,8 @@ fn cold_previews_with_shared_thumbnails_match_rendered_cache_hits() {
                     .expect("page surface");
                 let mut png = Vec::new();
                 surface.write_to_png(&mut png).expect("page PNG");
+                let _fixture =
+                    crate::util::ui_thread::allow(crate::util::ui_thread::Exception::TestSetup);
                 crate::ui::thumbnail_cache::store(&path, 1, &png);
                 let thumbnail = crate::ui::thumbnail_cache::lookup(&path, 1)
                     .expect("shared thumbnail is available");
@@ -160,6 +162,7 @@ fn cold_previews_with_shared_thumbnails_match_rendered_cache_hits() {
                     pdf_page: 0,
                     media_size: MediaPreviewSize::new(640, 800),
                     model_palette: crate::services::ModelPalette::default(),
+                    model_view: Default::default(),
                     archive_password: None,
                 };
                 let provider = LocalPreviewProvider::new(Rc::new(|| MediaPreviewBackend::Software));
@@ -179,6 +182,7 @@ fn cold_previews_with_shared_thumbnails_match_rendered_cache_hits() {
                                 page: 0,
                                 pages: 40,
                                 text_layer: None,
+                                model_mesh: None,
                             })
                         },
                     );
@@ -409,6 +413,7 @@ fn cancelled_in_flight_document_renders_keep_the_permit_and_emit_no_stale_events
                 pdf_page: 1,
                 media_size: MediaPreviewSize::new(640, 800),
                 model_palette: crate::services::ModelPalette::default(),
+                model_view: Default::default(),
                 archive_password: None,
             },
             Rc::new(move |event| events_for_emit.borrow_mut().push(event)),
@@ -424,6 +429,7 @@ fn cancelled_in_flight_document_renders_keep_the_permit_and_emit_no_stale_events
                         page: 1,
                         pages: 2,
                         text_layer: None,
+                        model_mesh: None,
                     })
                 } else {
                     Err("late renderer error".into())
@@ -494,6 +500,7 @@ fn cancelled_archive_listings_emit_no_stale_events() {
             pdf_page: 0,
             media_size: MediaPreviewSize::new(640, 800),
             model_palette: crate::services::ModelPalette::default(),
+            model_view: Default::default(),
             archive_password: None,
         },
         Rc::new(move |event| events_for_emit.borrow_mut().push(event)),
@@ -508,6 +515,7 @@ fn cancelled_archive_listings_emit_no_stale_events() {
                 page: 0,
                 pages: 0,
                 text_layer: None,
+                model_mesh: None,
             })
         },
     );
@@ -656,23 +664,31 @@ fn uncertain_file_names_resolve_their_preview_from_the_content() {
     let context = glib::MainContext::default();
     let _owner = context.acquire().expect("main context owner");
 
-    for (name, bytes, expected) in [
+    let activity = crate::services::file_activity::begin(
+        crate::services::file_activity::OperationScope::default(),
+    );
+    let data = &[0_u8, 159, 146, 150, 0, 255, 0, 1][..];
+    for (name, bytes, fenced, expected) in [
         (
             "some notes",
             &b"hello\nworld\n"[..],
-            PreviewContent::Text {
+            false,
+            Ok(PreviewContent::Text {
                 content: "hello\nworld\n".to_owned(),
                 truncated: false,
-            },
+            }),
         ),
+        ("some data", data, false, Ok(PreviewContent::Unsupported)),
         (
-            "some data",
-            &[0_u8, 159, 146, 150, 0, 255, 0, 1][..],
-            PreviewContent::Unsupported,
+            "fenced data",
+            data,
+            true,
+            Err(crate::services::file_activity::HELD_FOR_OPERATION),
         ),
     ] {
         let path = directory.path().join(name);
         fs::write(&path, bytes).expect("preview fixture");
+        let _fence = fenced.then(|| activity.fence([path.clone()]));
         let request = PreviewRequest {
             id: PreviewRequestId(1),
             entry: FileEntry {
@@ -696,6 +712,7 @@ fn uncertain_file_names_resolve_their_preview_from_the_content() {
             pdf_page: 0,
             media_size: MediaPreviewSize::new(640, 800),
             model_palette: crate::services::ModelPalette::default(),
+            model_view: Default::default(),
             archive_password: None,
         };
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -716,10 +733,12 @@ fn uncertain_file_names_resolve_their_preview_from_the_content() {
 
         let events = events.borrow();
         assert_eq!(events.len(), 1, "{name}");
-        let PreviewEvent::Ready(preview) = &events[0] else {
-            panic!("{name} preview failed");
+        let outcome = match &events[0] {
+            PreviewEvent::Ready(preview) => Ok(preview.content.clone()),
+            PreviewEvent::Failed { message, .. } => Err(message.as_str()),
+            _ => panic!("{name} preview neither loaded nor failed"),
         };
-        assert_eq!(preview.content, expected, "{name}");
+        assert_eq!(outcome, expected, "{name}");
     }
 }
 
@@ -771,6 +790,7 @@ fn text_subclassed_names_resolve_their_preview_from_the_type_hierarchy() {
             pdf_page: 0,
             media_size: MediaPreviewSize::new(640, 800),
             model_palette: crate::services::ModelPalette::default(),
+            model_view: Default::default(),
             archive_password: None,
         };
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -879,6 +899,16 @@ fn preview_families_follow_file_bytes_not_names() {
             Resolved::Unsupported,
         ),
         ("wide.txt", &utf16[..], Resolved::Text("hi\n".into())),
+        (
+            "DSCF0001.RAF",
+            &b"FUJIFILMCCD-RAW 0201FF383501\0"[..],
+            Resolved::Image,
+        ),
+        (
+            "GOPR0001.GPR",
+            &[0u8, 1, 2, 3, 255, 254][..],
+            Resolved::Image,
+        ),
     ] {
         let path = directory.path().join(name);
         fs::write(&path, bytes).expect("preview fixture");
@@ -905,6 +935,7 @@ fn preview_families_follow_file_bytes_not_names() {
             pdf_page: 0,
             media_size: MediaPreviewSize::new(640, 800),
             model_palette: crate::services::ModelPalette::default(),
+            model_view: Default::default(),
             archive_password: None,
         };
         let events = Rc::new(RefCell::new(Vec::new()));
@@ -913,19 +944,22 @@ fn preview_families_follow_file_bytes_not_names() {
             request,
             Rc::new(move |event| events_for_emit.borrow_mut().push(event)),
             move |_, operation, _, _, _| {
-                assert!(
+                let expected = if name.ends_with(".RAF") || name.ends_with(".GPR") {
+                    matches!(operation, crate::sandbox::ParseOperation::PreviewRaw)
+                } else {
                     matches!(
                         operation,
                         crate::sandbox::ParseOperation::PreviewImage
                             | crate::sandbox::ParseOperation::PreviewPdf(_)
-                    ),
-                    "{name} reached the sandbox as {operation:?}"
-                );
+                    )
+                };
+                assert!(expected, "{name} reached the sandbox as {operation:?}");
                 Ok(crate::sandbox::ParseOutput {
                     data: Vec::new(),
                     page: 0,
                     pages: 0,
                     text_layer: None,
+                    model_mesh: None,
                 })
             },
         );
@@ -997,6 +1031,7 @@ fn archives_list_member_trees_as_preview_content() {
                 pdf_page: 0,
                 media_size: MediaPreviewSize::new(640, 800),
                 model_palette: crate::services::ModelPalette::default(),
+                model_view: Default::default(),
                 archive_password: None,
             };
             let provider = LocalPreviewProvider::new(Rc::new(|| MediaPreviewBackend::Software));
@@ -1025,6 +1060,7 @@ fn archives_list_member_trees_as_preview_content() {
                         page: 0,
                         pages: 0,
                         text_layer: None,
+                        model_mesh: None,
                     })
                 },
             );
@@ -1106,6 +1142,7 @@ fn preview_archive_with_password(
         pdf_page: 0,
         media_size: MediaPreviewSize::new(640, 800),
         model_palette: crate::services::ModelPalette::default(),
+        model_view: Default::default(),
         archive_password: password
             .map(|password| crate::services::SecretString::new(password.to_owned())),
     };
@@ -1133,6 +1170,7 @@ fn preview_archive_with_password(
                 page: 0,
                 pages: 0,
                 text_layer: None,
+                model_mesh: None,
             })
         },
     );
@@ -1405,6 +1443,7 @@ fn unsupported_archive_preview_reports_unsupported_format() {
                 pdf_page: 0,
                 media_size: MediaPreviewSize::new(640, 800),
                 model_palette: crate::services::ModelPalette::default(),
+                model_view: Default::default(),
                 archive_password: None,
             };
             let provider = LocalPreviewProvider::new(Rc::new(|| MediaPreviewBackend::Software));
@@ -1431,6 +1470,7 @@ fn unsupported_archive_preview_reports_unsupported_format() {
                         page: 0,
                         pages: 0,
                         text_layer: None,
+                        model_mesh: None,
                     })
                 },
             );
@@ -1452,4 +1492,26 @@ fn unsupported_archive_preview_reports_unsupported_format() {
             assert_eq!(message, crate::adapters::ARCHIVE_UNSUPPORTED_MESSAGE);
         },
     );
+}
+
+#[test]
+fn text_reads_refuse_a_file_an_operation_fences() {
+    let directory = tempfile::tempdir().expect("fixture directory");
+    let path = directory.path().join("notes.txt");
+    fs::write(&path, "notes").expect("text file");
+    let file = gio::File::for_path(&path);
+    let read = || glib::MainContext::new().block_on(read_text(&file, Some(&path), 64));
+    let activity = crate::services::file_activity::begin(
+        crate::services::file_activity::OperationScope::default(),
+    );
+
+    let fence = activity.fence([directory.path().to_owned()]);
+    let refused = read().expect_err("a fenced file is not read");
+    drop(fence);
+
+    assert_eq!(
+        refused.message(),
+        crate::services::file_activity::HELD_FOR_OPERATION
+    );
+    assert_eq!(read().expect("read once the fence lifts").0, "notes");
 }

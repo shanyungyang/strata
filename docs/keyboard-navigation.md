@@ -37,10 +37,13 @@ Each tab retains its location, selection, navigation history, preview and search
 state. Tab locations persist across restarts: a plain launch (no folder
 argument, reveal request, or unlock target) reopens the previous tabs in order
 with the previously active tab selected, when **Settings → General → Startup →
-Restore open tabs** is on (the default). Missing directories, credential-bearing
-URIs, and transient locations such as trashed-item children, non-root Recent
-entries, and camera roots are skipped; with nothing restorable the window opens
-at the default directory as before. Windows opened for an explicit folder,
+Restore open tabs** is on (the default). Credential-bearing URIs and transient
+locations such as trashed-item children, non-root Recent entries, and camera
+roots are skipped; with nothing restorable the window opens at the default
+directory as before. Every saved folder gets its tab at once and is checked off
+the interface thread: a folder proven missing or not a folder closes its tab,
+and one that cannot be checked, such as on a server that does not answer, keeps
+its tab and shows its error. Windows opened for an explicit folder,
 reveal request, or unlock target never overwrite the saved session; with
 several plain-launch windows open the most recently changed one wins. Selection, history, and preview state stay
 in-memory. Appearance preferences and the clipboard remain
@@ -78,7 +81,7 @@ Pressing blank column content focuses that directory, including empty directorie
 
 **Shift+Up/Down** extends the selection from the range anchor by one item, **Shift+Page Up/Page Down** by one page. After Escape clears the selection, the range starts at the cursor.
 
-Copy/cut use the selection in the focused column, never a hovered row. In Columns, Delete/Shift+Delete with no selected items does nothing: an open parent-path marker is not an implicit deletion target. In List and Icons, Delete acts on the selection only. Delete in a location without Trash support, or after a Trash attempt fails because Trash is unsupported, opens the permanent-deletion confirmation with Cancel focused and the reason stated; Shift+Delete is unchanged.
+Copy/cut use the selection in the focused column, never a hovered row. In Columns, Delete/Shift+Delete with no selected items does nothing: an open parent-path marker is not an implicit deletion target. In List and Icons, Delete acts on the selection only. Delete in a location without Trash support, or after a Trash attempt fails because Trash is unsupported, opens the permanent-deletion confirmation with Cancel focused and the reason stated; Shift+Delete is unchanged. GIO reports Trash on most writable FUSE mounts (sshfs, rclone, cloud drives), so a refusal there is confirmed by a quick, read-only check of the mount and then remembered for that mount until Reload or a remount: later Deletes confirm up front and Move to Trash is hidden. Empty trash folders left by the failed attempt are removed. On network and cloud locations the confirmation says the items are deleted without Trash and that recovery depends on the storage provider, instead of promising permanent deletion; local disks, including `fuseblk` drives, keep the permanent wording, and a mixed selection uses it too.
 
 Background selection updates from directory loading must not move keyboard focus to an inactive column.
 
@@ -111,11 +114,15 @@ request — selects that target instead of restoring the remembered position.
 
 ## Refreshing a directory
 
-F5, the pane's Refresh button, Auto-refresh, and the rescan after a burst of
-external changes keep the selection, the keyboard cursor and the keyboard focus in
+F5, the pane's Refresh button, the rescan after a burst of external changes, and
+the re-read that a check of a network folder starts when it finds a change keep
+the selection, the keyboard cursor and the keyboard focus in
 every view: a focused row stays focused, and a focused Ctrl+F field keeps focus and
 its text. Icons and List also keep the scroll position. When the item under the
 cursor is gone, the cursor moves to the item now in its place without selecting it.
+On a mount that stopped answering, F5 and Refresh keep the rows as they are
+instead of clearing them; see
+[Unresponsive mounts](filesystem-compatibility.md#unresponsive-mounts).
 
 ## Creating files and folders
 
@@ -132,8 +139,9 @@ With nothing selected **Ctrl+Alt+N** falls back to a plain `new folder`. The ite
 is hidden in Trash, Recent, and while a recursive search is open.
 
 For **any file or folder rename**, Enter, clicking outside the field (even empty
-pane space), or moving keyboard focus away commits a valid name. Escape keeps
-the original name. Finishing with an empty or invalid name also keeps the
+pane space), or moving keyboard focus away commits a valid name. Switching to
+another window, or an input method switcher taking the keyboard, leaves the
+edit open. Escape keeps the original name. Finishing with an empty or invalid name also keeps the
 original. Cancelling the initial rename does **not** delete the new item: it
 remains under its allocated default name. File contents are preserved.
 While a name is being edited, **F5**, **Ctrl+K**, **Ctrl+Shift+K**, **Ctrl+Alt+T**
@@ -145,8 +153,9 @@ selection (the stem is selected); folder names containing dots are selected in f
 Names containing `/` or NUL, `.`/`..`, and whitespace-only names (including
 Unicode whitespace) are invalid. Valid names are used exactly as typed,
 including spaces around a nonblank name, hidden-file prefixes, and Unicode.
-Name conflicts, filesystem-specific limits, and permission errors retain the
-original item and report an error.
+Name conflicts, names the location would store as another (see [Names the user
+types](filesystem-compatibility.md#names-the-user-types)), filesystem-specific
+limits, and permission errors retain the original item and report an error.
 
 ## Filename patterns while filtering
 
@@ -155,8 +164,11 @@ ignoring case. Queries of at least four letters or digits also allow one inserte
 missing, substituted, or adjacent swapped character within a whole filename word.
 Words are separated by punctuation or spaces. For example, `trahs` finds
 `strata-trash.svg`, but `trash` does not find `strata-search.svg`. Shorter queries
-and queries containing punctuation remain literal. Indexed results rank literal
-matches ahead of typo matches; parent paths do not qualify a result.
+and queries containing punctuation remain literal. A query with spaces first
+matches the whole phrase, then names that contain every word in any order, so
+`duck txt` also finds `ducks_in_the_pool.txt`. Indexed results rank literal
+matches ahead of typo matches and scattered words; parent paths do not qualify
+a result.
 
 Add `*` for a whole-filename pattern without typo tolerance:
 
@@ -176,10 +188,13 @@ unchanged.
 
 Results follow the watched folders live: the open folder, and in Columns every open
 column. A matching file that another program creates or renames there appears within
-about a second, and a deleted one leaves the results as soon as the listing drops it.
+about a second, and one that another computer adds to a network folder at its next
+check, at first every 3 s in a focused window and less often otherwise
+([Cadence](filesystem-compatibility.md#cadence) says when checks slow down or stop).
+A deleted one leaves the results as soon as the listing drops it.
 With [Include subfolders](preferences.md#filter-scope) on, changes in folders below
-those reach the results on **F5**, Auto-refresh, the rescan after a burst of external
-changes, or when the filter is cleared and opened again.
+those reach the results on **F5**, the rescan after a burst of external changes, or
+when the filter is cleared and opened again.
 When another program renames the open folder itself, the view follows it and a filter
 typed in that folder ends, while filters and **Ctrl+K** searches rooted above it follow
 the rename. When the open folder is deleted or moved into another folder, the view
@@ -192,7 +207,7 @@ In the browser and file chooser, **Down** from the Ctrl+F input focuses the sele
 
 **Menu/Shift+F10** on a focused result opens its file menu. While the input itself is focused, its text-editing menu remains available. **Space** toggles quick preview for a selected file result in Columns, Icons, and List, including after returning to the query. Previewing a file keeps the query, selection, and current directory intact; on a selected folder result, Space navigates into the folder instead.
 
-While the input is focused, Space types into the query if no result is selected. **Shift+Space** inserts a space there even with a result selected. Space opens a selected folder in every view without opening or loading the preview pane; unsupported files do not open a preview.
+While the input is focused, Space types into the query if no result is selected. **Shift+Space** inserts a space there even with a result selected. Space acts on a selected result only from the input and the results; the location bar and other fields type it, and the sidebar and toolbar buttons keep their own Space. Space opens a selected folder in every view without opening or loading the preview pane; unsupported files do not open a preview.
 
 With a result focused, the first **Escape** dismisses the filter even while its quick preview is open; a second Escape closes the preview. **Ctrl+1/2/3** keep focus in the filter: in the input with the caret after the query, or on the focused result. With a query typed and focus elsewhere, the results take focus once they show. Loading or refreshing the folder never moves focus out of the input or its results. Neither does another program changing the folder, and that also holds for the [10xer](10xer-mode.md) **f** and **s** prompts.
 
@@ -207,8 +222,12 @@ first member. Enter opens the preview even when automatic previews are disabled;
 double-click and the archive's context menu still offer extraction. In Icons
 and List, Enter retains its archive extraction behavior.
 
-Other archive previews start at the archive root with the first member
-highlighted. In List and Columns modes, arrow keys act on the focused pane,
+In every view, moving the cursor onto an archive while the preview is open
+updates the preview without taking keyboard focus: a plain archive shows its
+members with none highlighted, and a password-protected archive shows its
+password prompt unfocused. Opening the preview on an archive with **Space**
+enters it directly, highlighting the first member or focusing the password
+field. In List and Columns modes, arrow keys act on the focused pane,
 not merely on an open preview. From the listing, **Right** enters the open
 preview. While the preview owns focus, its header shows the accent top border
 instead of the Miller column. Returning to the listing restores its cursor
@@ -245,7 +264,7 @@ when released. In
 
 ## Shortcut footer
 
-Every mode has a compact footer with **F1 · Shortcuts** on the left and clipboard status and the item count on the right. **Settings → General → Browsing → Show F1 Shortcuts button** controls the button's visibility (on by default). The preference is saved and updates all open windows immediately. Item counts and clipboard status remain visible when the button is hidden. F1 always opens the complete, mode-specific reference; closing it restores the button's configured visibility. F1, Escape, or a click outside it closes the reference, which blocks file-operation shortcuts while open. It stays open when the window loses focus. The reference is the only in-app keybinding list; it shows only the currently active map and live-updates when 10xer mode changes.
+Every mode has a compact footer with **F1 · Shortcuts** on the left and clipboard status and the item count on the right. **Settings → General → Browsing → Show F1 Shortcuts button** controls the button's visibility (on by default). The preference is saved and updates all open windows immediately. Item counts and clipboard status remain visible when the button is hidden. F1 always opens the complete, mode-specific reference; closing it restores the button's configured visibility. F1, Escape, or a click outside it closes the reference, which blocks file operations and commands such as **F5**, **Ctrl+K** and **Ctrl+,** while open. Its search field still takes text-editing and input method keys, such as **Ctrl+Left** and **Ctrl+Space**. It stays open when the window loses focus. The reference is the only in-app keybinding list; it shows only the currently active map and live-updates when 10xer mode changes.
 
 ## 10xer mode
 

@@ -84,7 +84,7 @@ class ContainerRunnerTests(unittest.TestCase):
             self.assertIsNone(call["notify"])
 
     def test_ci_explicitly_runs_the_engine_that_loaded_its_runtime(self):
-        workflow = (REPOSITORY / ".github/workflows/ci.yml").read_text()
+        workflow = (REPOSITORY / ".github/workflows/e2e.yml").read_text()
         loader = re.search(r"zstd -dc target/e2e-runtime/runtime.tar.zst \| (\w+) load", workflow)
         step = workflow.split("- name: Run the assigned scenarios without rebuilding or installing", 1)[1]
         step = step.split("- name:", 1)[0]
@@ -93,12 +93,18 @@ class ContainerRunnerTests(unittest.TestCase):
         self.assertIsNotNone(runner)
         self.assertEqual(loader.group(1), runner.group(1))
 
-    def test_worker_budget_is_forwarded_into_container(self):
-        for workers in ("auto", "1", "8"):
-            with self.subTest(workers=workers):
-                result, calls = self.run_runner(workers=workers)
+    def test_runner_settings_are_forwarded_into_container(self):
+        for name, value in (
+            ("STRATA_E2E_WORKERS", "auto"),
+            ("STRATA_E2E_WORKERS", "1"),
+            ("STRATA_E2E_WORKERS", "8"),
+            ("STRATA_E2E_MAIN_IO", "target/main-io/run"),
+            ("STRATA_UI_STALL_MS", "250"),
+        ):
+            with self.subTest(name=name, value=value):
+                result, calls = self.run_runner(extra_env={name: value})
                 self.assertEqual(result.returncode, 0, result.stderr)
-                self.assertIn(f"STRATA_E2E_WORKERS={workers}", calls[1]["args"])
+                self.assertIn(f"{name}={value}", calls[1]["args"])
 
     def test_rootless_podman_preserves_checkout_ownership(self):
         result, calls = self.run_runner("podman")

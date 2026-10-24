@@ -11,6 +11,7 @@ use crate::{
     app::peek::PeekState,
     model::{
         FileEntry, FolderSort, Location, MetadataValue, SortDirection, SortKey, ViewPreferences,
+        hidden_names::{self, Leftover},
     },
     services::{DirectoryChange, MetadataUpdate, RequestId},
 };
@@ -200,6 +201,8 @@ pub struct ColumnState {
     pub location: Location,
     pub entries: Vec<FileEntry>,
     entry_counts: Cell<Option<(bool, ColumnEntryCounts)>>,
+    leftovers: OnceCell<Rc<[(usize, Leftover)]>>,
+    pub(crate) surfaced_leftovers: Cell<usize>,
     // Providers may list a location twice.
     each_location_once: OnceCell<bool>,
     metadata_positions: Option<HashMap<Location, usize>>,
@@ -381,6 +384,8 @@ impl NavigationState {
                 location,
                 entries: Vec::new(),
                 entry_counts: Cell::new(None),
+                leftovers: OnceCell::new(),
+                surfaced_leftovers: Cell::new(0),
                 each_location_once: OnceCell::new(),
                 metadata_positions: None,
                 selected: None,
@@ -460,6 +465,8 @@ impl NavigationState {
             location,
             entries: Vec::new(),
             entry_counts: Cell::new(None),
+            leftovers: OnceCell::new(),
+            surfaced_leftovers: Cell::new(0),
             each_location_once: OnceCell::new(),
             metadata_positions: None,
             selected: None,
@@ -1258,6 +1265,7 @@ impl NavigationState {
         column.metadata_positions = None;
         if preferences.sort_key != SortKey::DeviceOrder {
             column.entries = sort_entries(std::mem::take(&mut column.entries), preferences);
+            column.leftovers.take();
             column.selected_locations.forget_positions();
         }
         column.selected = selected_location.and_then(|location| {
@@ -1318,6 +1326,20 @@ impl NavigationState {
             LoadState::Ready
         };
         Some((depth, cursor_moved))
+    }
+
+    pub fn keep_listing(&mut self, request_id: RequestId, truncated: bool) -> bool {
+        let Some((_, column)) = self.column_for_request_mut(request_id) else {
+            return false;
+        };
+        column.pending_selection.clear();
+        column.truncated = truncated;
+        column.load_state = if column.entries.is_empty() {
+            LoadState::Empty
+        } else {
+            LoadState::Ready
+        };
+        true
     }
 
     pub fn fail(&mut self, request_id: RequestId, message: String) -> Option<usize> {
@@ -1900,26 +1922,35 @@ impl NavigationState {
             .collect()
     }
 
-    /// The pane's committed fill in listing order, or its cursor item when
-    /// nothing is filled. A load cursor is not a fill, and another pane's
-    /// open-path marker is never a target.
+    /// The pane's committed fill in listing order. A load cursor is not a fill,
+    /// and another pane's open-path marker is never a target.
+    pub fn filled_entries(&self, depth: usize) -> Vec<FileEntry> {
+        let Some(column) = self.columns.get(depth) else {
+            return Vec::new();
+        };
+        if column.load_cursor.is_some() || column.selected_locations.is_empty() {
+            return Vec::new();
+        }
+        let visible = |entry: &FileEntry| column.preferences.show_hidden || !entry.is_hidden;
+        column
+            .selected_positions()
+            .iter()
+            .map(|position| &column.entries[*position])
+            .filter(|entry| visible(entry))
+            .cloned()
+            .collect()
+    }
+
+    /// `filled_entries`, or the pane's cursor item when nothing is filled.
     pub fn command_entries(&self, depth: usize) -> Vec<FileEntry> {
+        let filled = self.filled_entries(depth);
+        if !filled.is_empty() {
+            return filled;
+        }
         let Some(column) = self.columns.get(depth) else {
             return Vec::new();
         };
         let visible = |entry: &FileEntry| column.preferences.show_hidden || !entry.is_hidden;
-        if column.load_cursor.is_none() && !column.selected_locations.is_empty() {
-            let filled: Vec<FileEntry> = column
-                .selected_positions()
-                .iter()
-                .map(|position| &column.entries[*position])
-                .filter(|entry| visible(entry))
-                .cloned()
-                .collect();
-            if !filled.is_empty() {
-                return filled;
-            }
-        }
         column
             .selected
             .and_then(|position| column.entries.get(position))
@@ -2220,6 +2251,25 @@ impl NavigationState {
         Some(counts)
     }
 
+    pub(crate) fn column_leftover_names(&self, depth: usize) -> Rc<[(usize, Leftover)]> {
+        let Some(column) = self.columns.get(depth) else {
+            return Rc::new([]);
+        };
+        column
+            .leftovers
+            .get_or_init(|| {
+                column
+                    .entries
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, entry)| {
+                        Some((position, hidden_names::classify(&entry.native_name)?))
+                    })
+                    .collect()
+            })
+            .clone()
+    }
+
     pub fn active_child_position(&self, depth: usize) -> Option<usize> {
         let child = &self.columns.get(depth + 1)?.location;
         self.columns
@@ -2363,6 +2413,7 @@ impl ColumnState {
     /// Splices add, replace and remove rows by location, so they never add a repeat.
     fn invalidate_spliced_entry_indexes(&mut self) {
         self.entry_counts.set(None);
+        self.leftovers.take();
         self.metadata_positions = None;
         self.selected_locations.forget_positions();
     }

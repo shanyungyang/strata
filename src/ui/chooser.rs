@@ -10,7 +10,7 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
     rc::Rc,
     sync::{
         Arc,
@@ -27,7 +27,7 @@ use ashpd::{
 use gtk::{gdk::ModifierType, gio, glib, prelude::*};
 
 use crate::{
-    adapters::{LocalFileSource, LocalOperationProvider, LocalPreviewProvider},
+    adapters::{LocalFileSource, LocalOperationProvider, LocalPreviewProvider, probes},
     app::BrowserEvent,
     model::{EntryKind, FileEntry, Location, MetadataValue},
     portal::{
@@ -35,8 +35,8 @@ use crate::{
         writable_from_read_only,
     },
     services::{
-        DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, LoadHandle,
-        LocationIdentity, LocationValidationError, MetadataRequest, RemoteDownload,
+        DirectoryChange, DirectoryEvent, DirectoryRequest, FileSource, ItemIdentity, LoadHandle,
+        LocationValidationError, MetadataRequest, RemoteDownload, StampAnswer, Watching,
         download_remote, remote_file_url,
     },
 };
@@ -44,7 +44,7 @@ use crate::{
 use super::{
     blur::BlurBin,
     browser::{BrowserView, dismiss_modal_layer, modal_layer},
-    browser_modes::BrowserMode,
+    browser_modes::{BrowserMode, ThumbnailResize},
     controls::{
         ModalTone, focus_button, form_check_button, form_entry, form_label, menu_option,
         message_dialog_layout,
@@ -69,7 +69,8 @@ use super::{
 };
 
 type Completion = Box<dyn FnOnce(ashpd::backend::Result<SelectedFiles>)>;
-type DestinationValidator = Rc<dyn Fn(&Path) -> Result<PathBuf, String>>;
+type DestinationValidator =
+    Rc<dyn Fn(&Path) -> futures_lite::future::BoxedLocal<Result<PathBuf, String>>>;
 
 thread_local! {
     static CHOOSERS: RefCell<HashMap<String, glib::WeakRef<gtk::Window>>> = RefCell::new(HashMap::new());
@@ -115,6 +116,18 @@ impl ChooserFileSource {
     fn set_filter(&self, filter: Option<gtk::FileFilter>) {
         self.filter.replace(filter);
     }
+
+    fn refusal(&self, location: &Location) -> Result<(), LocationValidationError> {
+        if !self.allows_navigation(location) {
+            return Err(LocationValidationError::Refused(OUTSIDE_ROOT));
+        }
+        if location.native_path().is_none() && !location.is_recent_root() {
+            return Err(LocationValidationError::Refused(
+                "The system file chooser supports local files and folders only.",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl FileSource for ChooserFileSource {
@@ -132,15 +145,11 @@ impl FileSource for ChooserFileSource {
     }
 
     fn validate_location(&self, location: &Location) -> Result<(), LocationValidationError> {
-        if !self.allows_navigation(location) {
-            return Err(LocationValidationError::Refused(
-                "Choose an existing folder inside this removable device.",
-            ));
-        }
-        if location.native_path().is_none() && !location.is_recent_root() {
-            return Err(LocationValidationError::Refused(
-                "The system file chooser supports local files and folders only.",
-            ));
+        self.refusal(location)?;
+        if let (Some(root), Some(path)) = (&self.root_limit, location.native_path())
+            && !path.canonicalize().is_ok_and(|real| real.starts_with(root))
+        {
+            return Err(LocationValidationError::Refused(OUTSIDE_ROOT));
         }
         self.source.validate_location(location)
     }
@@ -150,10 +159,16 @@ impl FileSource for ChooserFileSource {
         location: Location,
         emit: Rc<dyn Fn(Result<(), LocationValidationError>)>,
     ) -> LoadHandle {
-        if self.root_limit.is_some()
-            || (location.native_path().is_none() && !location.is_recent_root())
+        if let (Some(root), Some(path)) = (self.root_limit.clone(), location.native_path())
+            && self.allows_navigation(&location)
         {
-            emit(self.validate_location(&location));
+            return after_containment(root, path.to_owned(), move |answer| {
+                emit(answer);
+                None
+            });
+        }
+        if let Err(refusal) = self.refusal(&location) {
+            emit(Err(refusal));
             return LoadHandle::new(|| {});
         }
         self.source.validate_location_async(location, emit)
@@ -176,69 +191,110 @@ impl FileSource for ChooserFileSource {
         let filter = self.filter.clone();
         let directory_only = self.directory_only.clone();
         let root_limit = self.root_limit.clone();
-        self.source.enumerate(
-            request,
-            Rc::new(move |event| {
-                let event = match event {
+        let emit: Rc<dyn Fn(DirectoryEvent)> = Rc::new(move |event| {
+            let event = match event {
+                DirectoryEvent::Batch {
+                    request_id,
+                    mut entries,
+                } => {
+                    entries.retain(|entry| {
+                        chooser_entry_allowed(
+                            filter.borrow().as_ref(),
+                            directory_only.get(),
+                            root_limit.as_deref(),
+                            entry,
+                        )
+                    });
                     DirectoryEvent::Batch {
                         request_id,
-                        mut entries,
-                    } => {
-                        entries.retain(|entry| {
-                            chooser_entry_allowed(
-                                filter.borrow().as_ref(),
-                                directory_only.get(),
-                                root_limit.as_deref(),
-                                entry,
-                            )
-                        });
-                        DirectoryEvent::Batch {
-                            request_id,
-                            entries,
-                        }
+                        entries,
                     }
-                    event => event,
-                };
-                emit(event);
-            }),
-        )
+                }
+                event => event,
+            };
+            emit(event);
+        });
+        let (Some(root), Some(path)) = (self.root_limit.clone(), request.location.native_path())
+        else {
+            return self.source.enumerate(request, emit);
+        };
+        let path = path.to_owned();
+        let source = self.source.clone();
+        after_containment(root, path, move |answer| match answer {
+            Ok(()) => Some(source.enumerate(request, emit)),
+            Err(error) => {
+                emit(DirectoryEvent::Failed {
+                    request_id: request.id,
+                    message: error.message(),
+                    refused: false,
+                });
+                None
+            }
+        })
     }
 
-    fn watch(
+    fn start_watch(
         &self,
         location: Location,
         include_hidden: bool,
         notify: Rc<dyn Fn(DirectoryChange)>,
-    ) -> Option<LoadHandle> {
+        report: Rc<dyn Fn(Watching)>,
+    ) -> LoadHandle {
         let filter = self.filter.clone();
         let directory_only = self.directory_only.clone();
         let root_limit = self.root_limit.clone();
-        self.source.watch(
-            location,
-            include_hidden,
-            Rc::new(move |change| {
-                notify(filter_directory_change(
-                    filter.borrow().as_ref(),
-                    directory_only.get(),
-                    root_limit.as_deref(),
-                    change,
-                ));
-            }),
-        )
+        let notify: Rc<dyn Fn(DirectoryChange)> = Rc::new(move |change| {
+            notify(filter_directory_change(
+                filter.borrow().as_ref(),
+                directory_only.get(),
+                root_limit.as_deref(),
+                change,
+            ));
+        });
+        let (Some(root), Some(path)) = (self.root_limit.clone(), location.native_path()) else {
+            return self
+                .source
+                .start_watch(location, include_hidden, notify, report);
+        };
+        let path = path.to_owned();
+        let source = self.source.clone();
+        after_containment(root, path, move |answer| match answer {
+            Ok(()) => Some(source.start_watch(location, include_hidden, notify, report)),
+            Err(_) => {
+                report(Watching::Unavailable);
+                None
+            }
+        })
     }
 
-    fn query_location_identity(
+    fn confined_to(&self) -> Option<&Path> {
+        self.root_limit.as_deref()
+    }
+
+    fn probe_stamp(&self, location: Location, emit: Rc<dyn Fn(StampAnswer)>) -> LoadHandle {
+        self.source.probe_stamp(location, emit)
+    }
+
+    fn check_stamps(
         &self,
-        location: Location,
-        emit: Rc<dyn Fn(Option<LocationIdentity>)>,
+        locations: Vec<Location>,
+        emit: Rc<dyn Fn(Location, StampAnswer)>,
     ) -> LoadHandle {
-        self.source.query_location_identity(location, emit)
+        self.source.check_stamps(locations, emit)
+    }
+
+    fn responsiveness(&self, location: &Location) -> crate::services::Responsiveness {
+        self.source.responsiveness(location)
+    }
+
+    fn follow_responsiveness(&self, notify: Rc<dyn Fn()>) -> LoadHandle {
+        self.source.follow_responsiveness(notify)
     }
 
     fn find_by_identity(
         &self,
         parent: Location,
-        identity: LocationIdentity,
+        identity: ItemIdentity,
         emit: Rc<dyn Fn(Option<Location>)>,
     ) -> LoadHandle {
         self.source.find_by_identity(parent, identity, emit)
@@ -253,17 +309,39 @@ fn file_filter_matches(filter: &gtk::FileFilter, entry: &FileEntry) -> bool {
     info.set_name(Path::new(&entry.native_name));
     info.set_display_name(&entry.display_name);
     info.set_file_type(gio::FileType::Regular);
-    let (content_type, _) =
-        gio::content_type_guess(Some(Path::new(&entry.native_name)), None::<&[u8]>);
+    let (content_type, _) = crate::services::guess_content_type(Path::new(&entry.native_name));
     info.set_content_type(&content_type);
     filter.match_(&info)
+}
+
+const OUTSIDE_ROOT: &str = "Choose an existing folder inside this removable device.";
+
+fn after_containment(
+    root: PathBuf,
+    path: PathBuf,
+    proven: impl FnOnce(Result<(), LocationValidationError>) -> Option<LoadHandle> + 'static,
+) -> LoadHandle {
+    let started: Rc<RefCell<Option<LoadHandle>>> = Rc::default();
+    let slot = started.clone();
+    let task = glib::MainContext::default().spawn_local(async move {
+        let answer = match probes::real_folder(&path).await {
+            Ok(real) if real.starts_with(&root) => Ok(()),
+            Ok(_) => Err(LocationValidationError::Refused(OUTSIDE_ROOT)),
+            Err(error) => Err(error),
+        };
+        let handle = proven(answer);
+        slot.replace(handle);
+    });
+    LoadHandle::new(move || {
+        task.abort();
+        started.take();
+    })
 }
 
 fn chooser_location_allowed(root: Option<&Path>, location: &Location) -> bool {
     root.is_none_or(|root| {
         location.native_path().is_some_and(|path| {
-            path.canonicalize()
-                .is_ok_and(|path| path.is_dir() && path.starts_with(root))
+            path.starts_with(root) && !path.components().any(|part| part == Component::ParentDir)
         })
     })
 }
@@ -539,6 +617,36 @@ impl ChooserState {
         true
     }
 
+    fn after_download_step<T: Send + 'static>(
+        self: &Rc<Self>,
+        work: impl FnOnce() -> T + Send + 'static,
+        then: impl FnOnce(&Rc<Self>, T) + 'static,
+    ) {
+        self.cancel_download();
+        let step = Arc::new(AtomicBool::new(false));
+        self.download_cancel.replace(Some(step.clone()));
+        self.accept_button.set_sensitive(false);
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            let answer = gio::spawn_blocking(work)
+                .await
+                .unwrap_or_else(|panic| std::panic::resume_unwind(panic));
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            let current = state
+                .download_cancel
+                .borrow()
+                .as_ref()
+                .is_some_and(|flag| Arc::ptr_eq(flag, &step));
+            if current {
+                state.download_cancel.take();
+                state.accept_button.set_sensitive(true);
+                then(&state, answer);
+            }
+        });
+    }
+
     fn open_remote(self: &Rc<Self>, url: &str) {
         if !matches!(
             self.request.kind,
@@ -564,14 +672,16 @@ impl ChooserState {
             .downloaded_file
             .borrow()
             .as_ref()
-            .filter(|(previous, path)| previous == url && path.is_file())
+            .filter(|(previous, _)| previous == url)
             .map(|(_, path)| path.clone());
-        if let Some(path) = cached {
-            self.complete_download(path);
-            return;
+        match cached {
+            Some(path) => self.reuse_download(url.to_owned(), path),
+            None => self.download(url.to_owned()),
         }
+    }
+
+    fn download(self: &Rc<Self>, url: String) {
         self.downloaded_file.take();
-        let url = url.to_owned();
         let cancelled = Arc::new(AtomicBool::new(false));
         *self.download_cancel.borrow_mut() = Some(cancelled.clone());
         let state = Rc::downgrade(self);
@@ -805,6 +915,69 @@ impl ChooserState {
         }
     }
 
+    fn install_filename_selection_click(self: &Rc<Self>) {
+        if !matches!(self.request.kind, ChooserKind::SaveFile { .. }) {
+            return;
+        }
+        let click = gtk::GestureClick::new();
+        click.set_button(1);
+        click.set_propagation_phase(gtk::PropagationPhase::Capture);
+        let weak = Rc::downgrade(self);
+        click.connect_pressed(move |gesture, _, x, y| {
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            if PreferenceManager::shared().tenxer_mode() {
+                return;
+            }
+            let Some(surface) = gesture.widget() else {
+                return;
+            };
+            let Some(picked) = surface.pick(x, y, gtk::PickFlags::DEFAULT) else {
+                return;
+            };
+            if super::focus_navigation::editable(&picked)
+                || super::focus_navigation::in_popover(&picked)
+                || !std::iter::successors(Some(picked), gtk::Widget::parent)
+                    .take_while(|widget| *widget != surface)
+                    .any(|widget| {
+                        widget.has_css_class("file-row")
+                            || widget.has_css_class("list-row")
+                            || widget.has_css_class("icons-card")
+                    })
+            {
+                return;
+            }
+            let location = state.view.browser().active_location();
+            let weak = Rc::downgrade(&state);
+            // Re-clicking a highlighted row emits no GTK selection change. Let the
+            // row handlers finish before committing its cursor and refilling the name.
+            glib::idle_add_local_once(move || {
+                let Some(state) = weak.upgrade() else {
+                    return;
+                };
+                let browser = state.view.browser();
+                if !state.window.is_visible() || browser.active_location() != location {
+                    return;
+                }
+                if state.view.selected_search_results().is_none()
+                    && browser.selection_is_load_cursor()
+                    && let Some((depth, position, _)) = browser.focused_item()
+                {
+                    browser.commit_selection();
+                    browser.set_selection(
+                        depth,
+                        &browser.selected_positions(depth),
+                        Some(position),
+                    );
+                }
+                state.filename_selection.borrow_mut().clear();
+                state.update_selected_filename();
+            });
+        });
+        self.view.widget().add_controller(click);
+    }
+
     fn update_selected_filename(&self) {
         let Some(filename) = self.filename.as_ref() else {
             return;
@@ -945,10 +1118,7 @@ impl ChooserState {
                     open_selection(&entries, &current, *directory, *multiple),
                     self.destination_host.as_ref(),
                 ) {
-                    (Ok(paths), Some(host)) => match (host.validate)(&paths[0]) {
-                        Ok(path) => self.complete_paths(vec![path], None),
-                        Err(message) => self.show_error(&message),
-                    },
+                    (Ok(paths), Some(host)) => self.accept_destination((host.validate)(&paths[0])),
                     (Ok(paths), None) => self.complete_paths(
                         paths,
                         self.read_only
@@ -970,6 +1140,31 @@ impl ChooserState {
                 self.accept_destinations(folder, names.clone());
             }
         }
+    }
+
+    fn accept_destination(
+        self: &Rc<Self>,
+        validation: futures_lite::future::BoxedLocal<Result<PathBuf, String>>,
+    ) {
+        self.destination_check.set(true);
+        self.accept_button.set_sensitive(false);
+        let generation = self.accept_generation.get();
+        let weak = Rc::downgrade(self);
+        let _task = glib::MainContext::default().spawn_local(async move {
+            let result = validation.await;
+            let Some(state) = weak.upgrade() else {
+                return;
+            };
+            state.destination_check.set(false);
+            if state.completion.borrow().is_none() || state.accept_generation.get() != generation {
+                return;
+            }
+            state.accept_button.set_sensitive(true);
+            match result {
+                Ok(path) => state.complete_paths(vec![path], None),
+                Err(message) => state.show_error(&message),
+            }
+        });
     }
 
     fn accept_open_name(self: &Rc<Self>, name: &str) {
@@ -1507,6 +1702,12 @@ fn build_chooser_hosted(
         .modal(request.modal)
         .build();
     crate::ui::decoration::claim_titlebar(&window);
+    let presence_view = view.downgrade();
+    super::presence::follow(&window, move |presence, power_saver| {
+        if let Some(view) = presence_view.upgrade() {
+            view.set_presence(presence, power_saver);
+        }
+    });
     if let Some(host) = &host {
         window.set_transient_for(Some(&host.parent));
         window.set_destroy_with_parent(true);
@@ -1528,6 +1729,7 @@ fn build_chooser_hosted(
         });
     }
     let header = gtk::HeaderBar::new();
+    header.add_css_class("browser-header");
     header.set_show_title_buttons(false);
     let sidebar_toggle = super::sidebar_toggle::SidebarToggle::new();
     let location = view.location_widget();
@@ -1802,6 +2004,7 @@ fn build_chooser_hosted(
         download_progress: RefCell::new(None),
     });
 
+    state.install_filename_selection_click();
     let weak = Rc::downgrade(&state);
     accept.connect_clicked(move |_| {
         if let Some(state) = weak.upgrade() {
@@ -1847,6 +2050,7 @@ fn build_chooser_hosted(
     }));
 
     let state_for_observer = state.clone();
+    preview.follow_operations(&browser);
     let preview_for_browser = preview.clone();
     let weak_browser = Rc::downgrade(&browser);
     browser.observe(move |event| {
@@ -2331,8 +2535,16 @@ fn install_shortcuts(
             return result;
         }
         if let Some(size) = preferences.text_size().for_shortcut(press) {
-            preferences.set_text_size(size);
+            state.view.set_text_size(size);
             return glib::Propagation::Stop;
+        }
+        if let Some(change) = ThumbnailResize::for_shortcut(press)
+            && state.view.resize_icons_thumbnails(change)
+        {
+            return glib::Propagation::Stop;
+        }
+        if tenxer.reference_is_open() {
+            return glib::Propagation::Proceed;
         }
         let browser = state.view.browser();
         let held = press.modifiers();
@@ -2473,7 +2685,7 @@ fn install_shortcuts(
             return glib::Propagation::Proceed;
         }
         if press.is(SPACE)
-            && let Some(entry) = state.view.selected_search_result()
+            && let Some(entry) = state.view.search_result_for_space()
         {
             if state.view.activate_directory_on_space() {
                 return glib::Propagation::Stop;
@@ -2583,6 +2795,7 @@ fn install_shortcuts(
         }
         if press.is(REFRESH.ignoring(SHORTCUT_MODIFIERS)) {
             if let Some(depth) = browser.active_depth() {
+                crate::adapters::trash_support::forget_all();
                 browser.retry_column(depth);
             }
             return glib::Propagation::Stop;

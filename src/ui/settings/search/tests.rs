@@ -28,6 +28,7 @@ fn localized_setting_titles_keep_stable_search_targets() {
                 ("10xer", "tenxer"),
                 ("Modus", "tenxer"),
                 ("Doppelklick", "opening"),
+                ("Miniaturansichten", "show-thumbnails"),
                 ("double click", "opening"),
             ] {
                 assert!(
@@ -63,6 +64,15 @@ fn localized_setting_titles_keep_stable_search_targets() {
                     "zh-CN: {query}"
                 );
             }
+            rust_i18n::set_locale("zh-TW");
+            // The titles are 顯示 F1 快捷鍵按鈕 and Omarchy 變體.
+            for (query, id) in [("快捷鍵按鈕", "hints"), ("Omarchy變體", "omarchy-variant")]
+            {
+                assert!(
+                    find_matches(&normalized(query)).ids.contains(id),
+                    "zh-TW: {query}"
+                );
+            }
         },
     );
 }
@@ -81,6 +91,8 @@ fn ranks_exact_labels_aliases_and_small_typing_errors() {
         ("show recent", "general", "sidebar-places"),
         ("tezt size", "theme", "text"),
         ("font size", "theme", "text"),
+        ("Show thumbnails", "theme", "show-thumbnails"),
+        ("photos", "theme", "show-thumbnails"),
         ("nightly", "updates", "channel"),
         ("relase chanel", "updates", "channel"),
         ("copyright", "about", "license"),
@@ -88,6 +100,10 @@ fn ranks_exact_labels_aliases_and_small_typing_errors() {
         ("keybindings", "general", "hints"),
         ("render documents", "general", "render-documents"),
         ("markdown", "general", "render-documents"),
+        ("add-ons", "integrations", "integrations"),
+        ("plugins", "integrations", "integrations"),
+        ("troubleshoot", "diagnostics", "diagnostics"),
+        ("ffmpeg", "diagnostics", "diagnostics"),
     ] {
         let matches = find_matches(&normalized(query));
         assert_eq!(matches.best_page, Some(page), "{query}");
@@ -150,6 +166,7 @@ fn settings_layer(manager: &Rc<PreferenceManager>) -> (gtk::Widget, gtk::Entry, 
         manager.clone(),
         Rc::new(|_| {}),
         super::super::install_guard(),
+        Rc::new(|_| {}),
     );
     layer.set_visible(true);
     let layer: gtk::Widget = layer.upcast();
@@ -484,6 +501,10 @@ fn every_page_row_is_registered_for_search() {
                 ),
                 ("actions", super::super::actions::actions_page()),
                 (
+                    "integrations",
+                    super::super::integrations::integrations_page(None),
+                ),
+                (
                     "updates",
                     super::super::updates_page(
                         manager.clone(),
@@ -493,6 +514,7 @@ fn every_page_row_is_registered_for_search() {
                     )
                     .0,
                 ),
+                ("diagnostics", super::super::diagnostics::diagnostics_page()),
                 ("about", super::super::about_page()),
             ];
             assert_eq!(
@@ -503,6 +525,7 @@ fn every_page_row_is_registered_for_search() {
                     .collect::<Vec<_>>(),
                 "build every navigation page"
             );
+            gtk::glib::MainContext::default().block_on(crate::ui::actions::shared().reload());
             let (_, actions_page) = pages
                 .iter()
                 .find(|(page, _)| *page == "actions")

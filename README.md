@@ -50,15 +50,16 @@ Strata combines spatial Miller-column navigation with familiar Icons and List vi
 
 - **Three browser modes:** navigable Columns, an Icons grid, and a sortable List table.
 - **Keyboard-first control:** directional-key movement, navigation history, location entry, pane filtering, fuzzy search, file operations, and quick previews. An optional footer and F1 shortcut reference help you learn each mode; the footer also shows clipboard status. See [keyboard navigation and paste destinations](docs/keyboard-navigation.md). Optional [10xer mode](docs/10xer-mode.md) hides window and pane chrome and uses Yazi-style keys.
-- **Fast recursive search:** press <kbd>Ctrl</kbd>+<kbd>K</kbd> to find files and directories by name or path while the tree is still being indexed. Global search covers Home and all mounted local drives, regardless of the current folder. Hover the search field to see the included locations. The dialog warns when results are incomplete; folder-scoped filtering/search remains separate. URI-native remote shares are not yet included.
+- **Fast recursive search:** press <kbd>Ctrl</kbd>+<kbd>K</kbd> to find files and directories by name or path while the tree is still being indexed. Global search covers Home and all mounted local drives, regardless of the current folder. Hover the search field to see the included locations. The dialog warns when results are incomplete; raise or remove the indexing time and entry limits under **Settings → General → Search & filtering** for slow or network mounts. Folder-scoped filtering/search remains separate. URI-native remote shares are not yet included.
 - **Rich previews and thumbnails:** native rendered Markdown and static HTML, plus bounded previews for text, source code, images, camera RAW, PDF, audio, and video, with native parser-backed formats isolated from the application. Audio opens in a now-playing view with artwork and a live spectrum; video gets technical badges, a keyframe storyboard while scrubbing, ambient light around the frame, silent autoplay that eases its sound in, and <kbd>Enter</kbd> hands the position to your default player. File Properties shows available media resolution, duration, bitrate, codecs, HDR, subtitle and chapter counts, and audio/video rates. RAW previews and Properties also show dimensions, camera, lens, focal length, shutter speed, ISO, and GPS coordinates, with `N/A` for unavailable values.
 - **Shared storage properties:** volumes and mounted storage entries in Devices use the same Properties dialog for name, device, filesystem, mount status, and available capacity/usage. **Set label…** saves a display label only in Strata; it never changes the filesystem label, mounts/unmounts a drive, or alters system configuration. Labels update the sidebar and Properties live and can be cleared to restore the normal device name. Formatting remains restricted to eligible removable drives; release actions follow the device's reported capabilities.
 - **Responsive filesystem work:** cancellable directory loading, bounded streaming, incremental monitoring, stable selection, and virtualized large directories.
 - **Everyday file operations:** create folders, rename, cut, copy, paste, trash, permanent delete, sorting, hidden files, pins, and history.
 - **Remote locations:** browse GIO/GVfs locations such as authenticated SMB shares and SFTP servers from the location field, with explicit host-key decisions.
-- **Adaptive appearance:** compact or airy density, six bundled themes, custom themes, and live Omarchy Quattro theme following.
+- **Adaptive appearance:** compact or airy density, 95 bundled themes, custom themes, and live Omarchy Quattro theme following.
 - **Updates in the app:** automatic update checks (on by default; turn them off in **Settings → Updates**), release notes, verified downloads, and in-place installation for release binaries.
 - **Custom actions:** add your own scripts to the file and folder context menus, with a manager in **Settings → Actions** and background progress in the Jobs dashboard. See [Custom actions](docs/custom-actions.md).
+- **Integrations:** opt-in providers maintained in the repository's [`integrations/`](integrations/README.md) catalog, installed, updated and removed from **Settings → Integrations**; they plug services and devices into the context menu and the **Send to…** menu. See [External file providers](docs/file-providers.md).
 - **System file chooser:** opt in through **Settings → General → System file chooser**, the installer, or `strata --install-portal`; see [portal setup](docs/portal-file-chooser.md).
 - **Encrypted-volume unlock:** opt in through the installer, **Settings → General → Desktop integration** on Omarchy, or `strata --install-udiskie-unlock`; restore with `strata --uninstall-udiskie-unlock` (Settings **Restore default** on Omarchy only).
 
@@ -69,14 +70,26 @@ Arch Linux and Omarchy are the primary supported environments. Current binaries 
 ### Interactive installation
 
 The interactive installer detects the Linux architecture, glibc version, Arch
-Linux, and Omarchy 3 or 4. It installs the latest verified stable release and
-offers optional desktop-menu, default-folder-handler, "Open file location", system
-file chooser, encrypted-volume unlock, SMB, broader image/RAW, and Omarchy keybind
-integration:
+Linux, and Omarchy 3 or 4. Choose the recommended installation for Strata and its
+application launcher without changing existing defaults, or customize the desktop,
+file chooser, encrypted-volume unlock, SMB, image/RAW, and shortcut integrations.
+Only options supported by your system are offered:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/lgse/strata/main/install.sh | bash
 ```
+
+Use the arrow keys and Enter to choose a setup; Space toggles custom options.
+Small or basic terminals use numbered choices instead. The original block-art logo
+uses its Tokyo Night pale-blue, blue, and violet brand colors; other colors follow
+your terminal palette. `NO_COLOR=1` disables colors. A continuous dithered progress
+bar shows actual transfer percentages, with a spinner when the total is unknown.
+Selected packages share one package-manager transaction, with its normal
+confirmation. Pass `--verbose` for detailed download and verification output;
+failures always show diagnostics.
+Integration results always remain visible, including service-restart notices.
+Detailed logs are retained for failures, warnings, and integration notices; package
+operations are logged without recording terminal password input.
 
 The installer shows every privileged package operation before asking to run it.
 It verifies both the published SHA-256 digest and GitHub Actions provenance before
@@ -93,10 +106,12 @@ curl -fsSL https://raw.githubusercontent.com/lgse/strata/main/install.sh \
       --with-smb \
       --with-raw \
       --with-desktop-entry \
-      --with-folder-association \
-      --with-omarchy-keybinds \
-      --with-udiskie-unlock
+      --with-folder-association
 ```
+
+Add `--with-omarchy-keybinds` only on Omarchy 3 or 4. Add
+`--with-udiskie-unlock` only when `udiskie` is already installed on an Arch-based
+system. Unsupported explicit options are rejected before installation begins.
 
 Each `--with-*` flag implies `--non-interactive`, and folder association implies
 the desktop entry and `--with-file-manager`. Use `--with-file-manager` by itself
@@ -194,6 +209,12 @@ Fedora; `gvfs-daemons` on Debian/Ubuntu). Without that backend, removable drives
 may be absent from Devices. SMB support remains optional. Phones need additional
 backends; see [Connecting phones](#connecting-phones).
 
+If previews, thumbnails, network locations, or drives don't work after installation,
+open **Settings → Diagnostics** and select **Run**. It tests each of these features,
+names any missing package with an install command for your distribution that
+you can copy or run in your terminal, and
+**Copy report** copies the results for a bug report.
+
 #### 2. Download and verify
 
 From the [latest release](https://github.com/lgse/strata/releases/latest), download the `.tar.gz` matching `$target` and its identically named `.sha256` file over HTTPS. Then verify its digest:
@@ -259,7 +280,7 @@ strata --version            # print the installed version
 
 In the default map, useful shortcuts include <kbd>Ctrl</kbd>+<kbd>K</kbd> for recursive search, <kbd>Ctrl</kbd>+<kbd>L</kbd> for a path or URI, <kbd>Ctrl</kbd>+<kbd>F</kbd> to filter the current pane, <kbd>Ctrl</kbd>+<kbd>Z</kbd> to undo or <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>Z</kbd> to redo the latest reversible file operation, <kbd>Space</kbd> for preview, <kbd>F2</kbd> to rename, and <kbd>Alt</kbd>+arrow keys for history and parent navigation.
 
-Toggle [10xer mode](docs/10xer-mode.md) with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> for Yazi-style navigation and footer prompts; <kbd>q</kbd> returns to the default map. In 10xer mode, <kbd>l</kbd>/<kbd>→</kbd> enters preview, <kbd>h</kbd> returns to the listing without closing it, and <kbd>i</kbd> toggles it.
+Toggle [10xer mode](docs/10xer-mode.md) with <kbd>Ctrl</kbd>+<kbd>Shift</kbd>+<kbd>M</kbd> for Yazi-style navigation and footer prompts; press it again to return to the default map. In 10xer mode, <kbd>l</kbd>/<kbd>→</kbd> enters preview, <kbd>h</kbd> returns to the listing without closing it, and <kbd>i</kbd> toggles it.
 
 In narrow or highly scaled windows, the file view takes priority: the preview shrinks, then hides when there is not enough room for both. Widening the window restores the preview and its session width automatically. Hidden previews pause playback and defer loading new selections; unchanged previews return without reloading the file.
 
@@ -483,6 +504,8 @@ should be isolated and reversible.
 
 Press <kbd>Ctrl</kbd>+<kbd>L</kbd>, enter an address such as `smb://server/share` or `sftp://user@host:2222/path`, and press <kbd>Enter</kbd>. Strata uses GIO/GVfs and prompts for credentials when required. Remote protocols need their GVfs backend installed; distributions split these up differently, so check yours for the SMB backend (`gvfs-smb` on Arch) and the SFTP backend (part of `gvfs` on Arch, `gvfs-backends` on Debian and Ubuntu).
 
+Open folders on network shares, including these, are checked every few seconds while a window shows them, and re-read when another computer changed them; see [Changes made elsewhere](docs/filesystem-compatibility.md#changes-made-elsewhere).
+
 SFTP accepts password and SSH-key authentication. Encrypted keys can be unlocked in your SSH agent; if GVfs asks Strata for a key passphrase or host-key decision, Strata presents the request without deciding for you. See [docs/remote-sftp.md](docs/remote-sftp.md), which also documents `scripts/sftp-fixture.sh`, a disposable OpenSSH server for testing.
 
 ## Custom actions and script authoring
@@ -637,7 +660,7 @@ Open **Settings → Appearance** from the gear menu or with <kbd>Ctrl</kbd>+<kbd
 
 Use **Search settings** to filter options across pages and navigate to the closest match, including keywords such as “font size.” In compact windows, the magnifying-glass button opens the search field. Clear the query or press <kbd>Esc</kbd> in the field to restore all settings.
 
-![Strata Theme and appearance settings showing Omarchy following, six bundled themes, and the Add a theme option](docs/assets/strata-themes.png)
+![Strata Appearance settings showing Follow Omarchy, the Omarchy variant, the current theme, and the searchable theme library](docs/assets/strata-themes.png)
 
 ### Follow Omarchy Quattro
 
@@ -647,13 +670,15 @@ This integration supports Omarchy Quattro only. The switch is hidden when Strata
 
 ### Bundled themes
 
-Choose any included theme from **Settings → Appearance**: Azure Glow, Tokyo Night, Catppuccin, Everforest, Rosé Pine, or Omarchy Light. Selecting a bundled theme turns off Omarchy following and keeps that theme active across restarts.
+Choose any of the 95 included themes from the searchable, light/dark-filterable library under **Settings → Appearance**, including Tokyo Night (the default), Azure Glow, Catppuccin, Everforest, Rosé Pine, Gruvbox, Nord, Dracula, Solarized, and Omarchy Light. Selecting a bundled theme turns off Omarchy following and keeps that theme active across restarts.
 
 ### Custom themes
 
 Select **Add a theme**, enter a name, and choose the semantic colors for the background, surfaces, text, accent, danger, muted and highlighted elements, borders, and dimmed text. Strata previews edits live and saves completed themes under **Your themes**.
 
 Custom themes are stored as shareable TOML files in `~/.config/strata/themes/`. A selected theme is re-read when its file changes on disk, so a generator that rewrites it in place (for example a [matugen](https://github.com/InioX/matugen) template following the wallpaper) updates open windows without a restart. See [Themes](docs/themes.md) for the schema, file location, live updates, and Omarchy color mapping.
+
+To go beyond the color tokens, an optional `~/.config/strata/style.css` is loaded above Strata's own stylesheets and re-read when it changes; see [User stylesheet](docs/themes.md#user-stylesheet).
 
 ## Release channels
 
@@ -665,6 +690,8 @@ To try upcoming changes early, choose a channel in **Settings → Updates** (the
 
 When a prerelease installation selects **Stable**, the Updates card immediately offers the newest stable release as the channel target—even when that requires a semantic downgrade—and labels the action **Return to stable**. Preview and Nightly selections use the same card for ordinary forward updates, so channel changes never create a separate competing rollback card.
 
+To roll back or switch to a particular build, open **Install a specific release** in **Settings → Updates**. It lists the releases your channel offers, newest first, whether older or newer than the installed one: Stable lists stable releases, Preview adds alpha, beta, and release-candidate builds, and Nightly lists everything. Strata asks GitHub for the list only when the menu opens, and lists only releases with a signed update manifest for your architecture. Choosing one opens the same verified install dialog as an update. Package-managed installations do not show the list, since their package manager decides the version.
+
 See [Releasing](docs/releasing.md) for the tag grammar these channels rely on and, for maintainers, how a release candidate is cut and promoted.
 
 ## Under the hood
@@ -673,7 +700,7 @@ See [Releasing](docs/releasing.md) for the tag grammar these channels rely on an
 
 Strata walks and indexes the selected directory tree on a background thread, never on GTK's UI thread. Results appear progressively during that walk. Names and relative paths are normalized once as index entries are created, and each query maintains only the best **100** fuzzy-ranked matches instead of sending an unbounded result set to the interface.
 
-Rapid keystrokes are coalesced to the newest query. During indexing, result publication is throttled to 50 ms intervals; the UI consumes those bounded updates on its own timed loop, keeping rendering aligned with responsive frame-sized work. Exact and contiguous matches, word/path boundaries, and names rank ahead of loose path subsequences.
+Each walk stops at the saved time and entry limits (10 s and 200,000 entries by default, each adjustable up to no limit) and reports partial results. Rapid keystrokes are coalesced to the newest query. During indexing, result publication is throttled to 50 ms intervals; the UI consumes those bounded updates on its own timed loop, keeping rendering aligned with responsive frame-sized work. Exact and contiguous matches, word/path boundaries, and names rank ahead of loose path subsequences.
 
 The deliberate tradeoff: this is fast **filename and path** search, not file-content or metadata search.
 
@@ -683,7 +710,7 @@ Files shown while browsing are untrusted. Image, camera RAW, PDF, thumbnail, and
 
 Only media helpers may receive allowlisted GPU render devices, and only for accelerated decoding; image, PDF, and thumbnail helpers receive no device mounts. Images are normalized to bounded PNG images. Media arrives incrementally as validated raw RGBA frames and fixed-format PCM: GTK presents textures and GStreamer outputs raw audio, without opening the original file or decoding a compressed clip. Four media sessions per process, bounded queues, and paused-worker cleanup limit concurrent work. Cancellation or timeout kills the process group and Bubblewrap PID namespace, tearing down descendants. Missing isolation, crashes, malformed output, timeouts, and permission failures all fail closed to a normal icon or **Preview unavailable**—Strata never silently retries an untrusted native parser without the sandbox.
 
-Plain-text and source previews are different: they stay in process because they do not invoke a native format parser, and reads are capped at 1 MiB. See [Preview sandbox](docs/preview-sandbox.md) for provider ordering, exact mounts, formats, and resource budgets.
+Plain-text and source previews are different: they stay in process because they do not invoke a native format parser, and reads are capped at 1 MiB. See [Preview sandbox](docs/preview-sandbox.md) for provider ordering, exact mounts, formats, and resource budgets. For settings that further reduce exposure, such as software-only video decoding, see [Hardened configuration](docs/hardened-configuration.md).
 
 ## Technical specifications
 
@@ -706,11 +733,16 @@ Build requirements are the latest stable Rust toolchain, a C toolchain, `pkg-con
 ```bash
 sudo pacman -S --needed base-devel bubblewrap ffmpeg ffmpegthumbnailer fontconfig \
   gstreamer gst-libav gst-plugins-base gst-plugins-good gtk4 gtksourceview5 gvfs poppler-glib
+mise run install-local    # build an optimized release and install it for your user
 mise run start-dev        # rebuild and restart as files change
 mise run dev              # build and launch the main app once
 mise run chooser-dev      # build and open an isolated Save chooser with choices
 mise run check            # format, compile, Clippy, tests, and policy checks
 ```
+
+`start-dev`, `dev`, and `chooser-dev` make unoptimized debug builds for development, which
+scroll and load noticeably slower. Use `install-local` for everyday use. A debug build reports
+its version with a `+debug` suffix in `strata --version` and in Settings → About.
 
 ### Builds without RAR support
 
@@ -735,9 +767,12 @@ Start with [CONTRIBUTING.md](CONTRIBUTING.md) before opening a pull request. Dee
 - [Preview panel and column layout](docs/preview-panel-layout.md)
 - [10xer mode](docs/10xer-mode.md)
 - [Architecture principles](docs/architecture.md)
+- [Filesystem compatibility](docs/filesystem-compatibility.md)
 - [Preview sandbox](docs/preview-sandbox.md)
+- [Hardened configuration](docs/hardened-configuration.md)
 - [Performance baseline](docs/performance-baseline.md)
 - [Custom actions](docs/custom-actions.md)
+- [External file providers and bundled integrations](docs/file-providers.md)
 - [Themes and Omarchy integration](docs/themes.md)
 - [Unsafe code policy](docs/unsafe-code.md)
 - [Releasing](docs/releasing.md)

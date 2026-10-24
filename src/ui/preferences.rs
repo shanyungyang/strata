@@ -4,9 +4,9 @@ use std::{
     cell::{Cell, RefCell},
     collections::HashMap,
     fs, io,
-    os::unix::fs::MetadataExt,
     path::{Component, Path, PathBuf},
     rc::Rc,
+    time::Duration,
 };
 
 use gtk::{glib, prelude::*};
@@ -15,9 +15,14 @@ use serde::{Deserialize, Serialize};
 use crate::{
     model::{FolderColorValue, SortDirection, SortKey, ViewPreferences},
     sandbox::MediaPreviewBackend,
-    services::{Channel, CrossVolumeDropStrategy},
+    services::{Channel, CrossVolumeDropStrategy, SearchLimits},
+    storage::{
+        file_stamp,
+        writer::{self, Policy},
+    },
 };
 
+use super::browser_modes::DensityScale;
 use super::icons_cell::{MAX_ICONS_THUMBNAIL_SIZE, MIN_ICONS_THUMBNAIL_SIZE};
 
 pub(in crate::ui) const SEND_TO_RECENT_DESTINATIONS_LIMIT: usize = 3;
@@ -90,6 +95,10 @@ pub(in crate::ui) struct Preferences {
     search_open_files_directly: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     search_exclusions: Vec<String>,
+    #[serde(default = "default_search_time_limit")]
+    search_time_limit: u32,
+    #[serde(default = "default_search_entry_limit")]
+    search_entry_limit: u32,
     #[serde(default = "default_enabled")]
     type_to_search: bool,
     #[serde(default)]
@@ -116,6 +125,12 @@ pub(in crate::ui) struct Preferences {
     browser_mode: String,
     #[serde(default = "default_browser_density")]
     browser_density: String,
+    #[serde(default = "default_density_custom_px")]
+    browser_density_custom_px: u8,
+    #[serde(default = "default_frame_density")]
+    frame_density: String,
+    #[serde(default = "default_density_custom_px")]
+    frame_density_custom_px: u8,
     #[serde(default)]
     group_by_type: bool,
     #[serde(default = "default_file_clicks", rename = "list_file_clicks")]
@@ -162,6 +177,8 @@ pub(in crate::ui) struct Preferences {
     text_size: TextSize,
     #[serde(default)]
     corner_roundness: CornerRoundness,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    interface_font: Option<String>,
     #[serde(default)]
     interface_renderer: InterfaceRenderer,
     #[serde(default)]
@@ -182,10 +199,12 @@ pub(in crate::ui) struct Preferences {
     preview_text_wrap: bool,
     #[serde(default)]
     preview_autoplay: bool,
-    #[serde(default)]
-    auto_refresh_interval: u32,
+    #[serde(default = "default_enabled")]
+    watch_network_folders: bool,
     #[serde(default = "crate::sandbox::browser::default_worker_limit")]
     thumbnail_workers: usize,
+    #[serde(default = "default_enabled")]
+    show_thumbnails: bool,
     #[serde(default = "default_icons_thumbnail_size")]
     icons_thumbnail_size: i32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -218,6 +237,99 @@ pub(in crate::ui) struct Preferences {
     chooser_list_columns: Option<ListColumns>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     browser_list_columns: Option<ListColumns>,
+    #[serde(
+        default = "default_list_column_order",
+        skip_serializing_if = "is_default_list_column_order"
+    )]
+    list_column_order: Vec<ListColumnId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    list_hidden_columns: Vec<ListColumnId>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum ListColumnId {
+    Name,
+    Mode,
+    Size,
+    #[serde(rename = "type")]
+    Type,
+    Modified,
+}
+
+impl ListColumnId {
+    pub const ALL: [Self; 5] = [
+        Self::Name,
+        Self::Mode,
+        Self::Size,
+        Self::Type,
+        Self::Modified,
+    ];
+
+    pub fn index(self) -> usize {
+        match self {
+            Self::Name => 0,
+            Self::Mode => 1,
+            Self::Size => 2,
+            Self::Type => 3,
+            Self::Modified => 4,
+        }
+    }
+
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Name => "Name",
+            Self::Mode => "Mode",
+            Self::Size => "Size",
+            Self::Type => "Type",
+            Self::Modified => "Modified",
+        }
+    }
+
+    pub fn css_class(self) -> &'static str {
+        match self {
+            Self::Name => "list-col-name",
+            Self::Mode => "list-col-mode",
+            Self::Size => "list-col-size",
+            Self::Type => "list-col-type",
+            Self::Modified => "list-col-modified",
+        }
+    }
+}
+
+pub fn default_list_column_order() -> Vec<ListColumnId> {
+    ListColumnId::ALL.to_vec()
+}
+
+fn is_default_list_column_order(order: &[ListColumnId]) -> bool {
+    order == ListColumnId::ALL
+}
+
+pub(crate) fn sanitize_list_column_order(order: &[ListColumnId]) -> Vec<ListColumnId> {
+    let mut sanitized = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for col in order {
+        if seen.insert(*col) {
+            sanitized.push(*col);
+        }
+    }
+    for col in ListColumnId::ALL {
+        if seen.insert(col) {
+            sanitized.push(col);
+        }
+    }
+    sanitized
+}
+
+pub(crate) fn sanitize_list_hidden_columns(hidden: &[ListColumnId]) -> Vec<ListColumnId> {
+    let mut sanitized = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    for col in hidden {
+        if *col != ListColumnId::Name && seen.insert(*col) {
+            sanitized.push(*col);
+        }
+    }
+    sanitized
 }
 
 /// Unscaled pixels; an unset `name` lets Name absorb the remaining space.
@@ -256,6 +368,8 @@ impl Default for Preferences {
             video_preview_backend: default_video_preview_backend(),
             search_open_files_directly: false,
             search_exclusions: Vec::new(),
+            search_time_limit: default_search_time_limit(),
+            search_entry_limit: default_search_entry_limit(),
             type_to_search: true,
             arrow_navigation_scoped: false,
             tenxer_mode: false,
@@ -269,6 +383,9 @@ impl Default for Preferences {
             file_icon_colors: FileIconColors::default(),
             browser_mode: default_browser_mode(),
             browser_density: default_browser_density(),
+            browser_density_custom_px: default_density_custom_px(),
+            frame_density: default_frame_density(),
+            frame_density_custom_px: default_density_custom_px(),
             group_by_type: false,
             columns_file_clicks: default_file_clicks(),
             columns_folder_clicks: default_folder_clicks(),
@@ -292,6 +409,7 @@ impl Default for Preferences {
             show_hidden: false,
             text_size: TextSize::default(),
             corner_roundness: CornerRoundness::default(),
+            interface_font: None,
             interface_renderer: InterfaceRenderer::default(),
             language: crate::i18n::Language::default(),
             folders_first: true,
@@ -302,8 +420,9 @@ impl Default for Preferences {
             preview_volume: default_full_volume(),
             preview_text_wrap: false,
             preview_autoplay: false,
-            auto_refresh_interval: 0,
+            watch_network_folders: true,
             thumbnail_workers: crate::sandbox::browser::default_worker_limit(),
+            show_thumbnails: true,
             icons_thumbnail_size: default_icons_thumbnail_size(),
             chooser_column_width: None,
             browser_column_width: None,
@@ -320,6 +439,8 @@ impl Default for Preferences {
             device_labels: HashMap::new(),
             chooser_list_columns: None,
             browser_list_columns: None,
+            list_column_order: default_list_column_order(),
+            list_hidden_columns: Vec::new(),
         }
     }
 }
@@ -360,6 +481,36 @@ fn default_browser_density() -> String {
     "compact".to_owned()
 }
 
+fn default_frame_density() -> String {
+    "compact".to_owned()
+}
+
+/// Only read when the matching density is `"custom"`.
+fn default_density_custom_px() -> u8 {
+    0
+}
+
+fn stored_density<D: DensityScale>(mode: &str, custom_px: u8) -> D {
+    match mode {
+        "airy" => D::from_px(D::AIRY_PX),
+        "custom" => D::from_px(custom_px),
+        _ => D::from_px(D::COMPACT_PX),
+    }
+}
+
+fn store_density<D: DensityScale>(density: D, mode: &mut String, custom_px: &mut u8) {
+    let px = density.px();
+    *mode = if px == D::COMPACT_PX {
+        "compact"
+    } else if px == D::AIRY_PX {
+        "airy"
+    } else {
+        *custom_px = px;
+        "custom"
+    }
+    .to_owned();
+}
+
 fn default_file_clicks() -> u8 {
     2
 }
@@ -385,6 +536,20 @@ fn default_sidebar_order() -> Vec<String> {
         "pictures".to_owned(),
         "videos".to_owned(),
     ]
+}
+
+fn default_search_time_limit() -> u32 {
+    SearchLimits::default()
+        .time_budget
+        .and_then(|budget| u32::try_from(budget.as_secs()).ok())
+        .unwrap_or(0)
+}
+
+fn default_search_entry_limit() -> u32 {
+    SearchLimits::default()
+        .max_entries
+        .and_then(|entries| u32::try_from(entries).ok())
+        .unwrap_or(0)
 }
 
 fn default_sort_key() -> String {
@@ -419,27 +584,35 @@ fn normalized_volume(volume: f64) -> f64 {
     }
 }
 
-/// The Settings menu's choices are the only intervals the browser runs.
-pub(in crate::ui) const AUTO_REFRESH_CHOICES: [(&str, u32); 4] =
-    [("Off", 0), ("1 min", 60), ("5 min", 300), ("10 min", 600)];
+pub(in crate::ui) const SEARCH_TIME_LIMIT_CHOICES: [(&str, u32); 6] = [
+    ("10 s", 10),
+    ("30 s", 30),
+    ("1 min", 60),
+    ("5 min", 300),
+    ("15 min", 900),
+    ("No limit", 0),
+];
 
-// `normalized_auto_refresh_interval` picks the first choice at or above a value.
-const _: () = {
-    let mut index = 1;
-    while index < AUTO_REFRESH_CHOICES.len() {
-        assert!(AUTO_REFRESH_CHOICES[index - 1].1 < AUTO_REFRESH_CHOICES[index].1);
-        index += 1;
+pub(in crate::ui) const SEARCH_ENTRY_LIMIT_CHOICES: [(&str, u32); 5] = [
+    ("200,000", 200_000),
+    ("500,000", 500_000),
+    ("1,000,000", 1_000_000),
+    ("5,000,000", 5_000_000),
+    ("No limit", 0),
+];
+
+/// Unlisted limits round up to the next choice; 0 and anything past the largest
+/// choice mean no limit.
+fn normalized_search_limit(value: u32, choices: &[(&str, u32)]) -> u32 {
+    if value == 0 {
+        return 0;
     }
-};
-
-/// Unlisted intervals round up to the next choice so a hand-written value keeps
-/// auto-refresh on without reloading faster than the fastest menu option.
-fn normalized_auto_refresh_interval(secs: u32) -> u32 {
-    AUTO_REFRESH_CHOICES
+    choices
         .iter()
-        .map(|(_, interval)| *interval)
-        .find(|interval| *interval >= secs)
-        .unwrap_or(AUTO_REFRESH_CHOICES[AUTO_REFRESH_CHOICES.len() - 1].1)
+        .map(|(_, limit)| *limit)
+        .filter(|limit| *limit != 0)
+        .find(|limit| *limit >= value)
+        .unwrap_or(0)
 }
 
 pub(in crate::ui) fn is_valid_send_to_relative_path(path: &Path) -> bool {
@@ -454,8 +627,9 @@ pub struct PreferenceManager {
     startup_locale: &'static str,
     changes: bindings::PreferenceChanges,
     persistence_dirty: Cell<bool>,
-    /// The settings file as this process last wrote or read it.
-    settings_synced: Cell<Option<FileStamp>>,
+    saves_requested: Cell<u64>,
+    saves_finished: Cell<u64>,
+    this: std::rc::Weak<Self>,
     /// Why saving is off for this session: the file existed but could not be read.
     load_failure: Option<io::Error>,
     save_notices: save_notice::SaveNotices,
@@ -478,7 +652,7 @@ impl PreferenceManager {
     }
 
     fn load() -> Rc<Self> {
-        let settings_synced = file_stamp(&settings_path());
+        writer::note(&settings_path(), file_stamp(&settings_path()));
         let (mut preferences, load_failure) = match read_preferences() {
             Ok(preferences) => (preferences, None),
             Err(error) => {
@@ -488,8 +662,10 @@ impl PreferenceManager {
             }
         };
         preferences.preview_volume = normalized_volume(preferences.preview_volume);
-        preferences.auto_refresh_interval =
-            normalized_auto_refresh_interval(preferences.auto_refresh_interval);
+        preferences.search_time_limit =
+            normalized_search_limit(preferences.search_time_limit, &SEARCH_TIME_LIMIT_CHOICES);
+        preferences.search_entry_limit =
+            normalized_search_limit(preferences.search_entry_limit, &SEARCH_ENTRY_LIMIT_CHOICES);
         preferences.thumbnail_workers = preferences
             .thumbnail_workers
             .clamp(1, crate::sandbox::browser::MAX_WORKERS);
@@ -506,17 +682,22 @@ impl PreferenceManager {
         preferences.browser_list_columns = preferences
             .browser_list_columns
             .filter(ListColumns::is_valid);
+        preferences.list_column_order = sanitize_list_column_order(&preferences.list_column_order);
+        preferences.list_hidden_columns =
+            sanitize_list_hidden_columns(&preferences.list_hidden_columns);
         super::motion::set_reduce_motion(preferences.reduce_motion);
         crate::util::set_date_format(crate::util::DateFormat::parse(&preferences.date_format));
 
         let startup_locale = preferences.language.locale();
         rust_i18n::set_locale(startup_locale);
-        Rc::new(Self {
+        let manager = Rc::new_cyclic(|this| Self {
             startup_locale,
             startup_interface_renderer: preferences.interface_renderer,
             changes: bindings::PreferenceChanges::new(preferences.clone()),
             persistence_dirty: Cell::new(false),
-            settings_synced: Cell::new(settings_synced),
+            saves_requested: Cell::new(0),
+            saves_finished: Cell::new(0),
+            this: this.clone(),
             load_failure,
             save_notices: save_notice::SaveNotices::default(),
             folder_views: std::cell::OnceCell::new(),
@@ -524,7 +705,9 @@ impl PreferenceManager {
             folder_save_notices: save_notice::SaveNotices::for_folder_views(),
             item_customizations: Default::default(),
             preferences: RefCell::new(preferences),
-        })
+        });
+        manager.folder_view_store();
+        manager
     }
 
     /// Repairs loaded values whose validity depends on data the preference store
@@ -783,6 +966,38 @@ impl PreferenceManager {
         self.save_preferences();
     }
 
+    /// Seconds one search walk may index; 0 means no limit.
+    pub fn search_time_limit(&self) -> u32 {
+        self.preferences.borrow().search_time_limit
+    }
+
+    pub fn set_search_time_limit(&self, secs: u32) {
+        self.preferences.borrow_mut().search_time_limit =
+            normalized_search_limit(secs, &SEARCH_TIME_LIMIT_CHOICES);
+        self.save_preferences();
+    }
+
+    /// Files and folders one search walk may index; 0 means no limit.
+    pub fn search_entry_limit(&self) -> u32 {
+        self.preferences.borrow().search_entry_limit
+    }
+
+    pub fn set_search_entry_limit(&self, entries: u32) {
+        self.preferences.borrow_mut().search_entry_limit =
+            normalized_search_limit(entries, &SEARCH_ENTRY_LIMIT_CHOICES);
+        self.save_preferences();
+    }
+
+    pub fn search_limits(&self) -> SearchLimits {
+        let preferences = self.preferences.borrow();
+        SearchLimits {
+            time_budget: (preferences.search_time_limit != 0)
+                .then(|| Duration::from_secs(u64::from(preferences.search_time_limit))),
+            max_entries: (preferences.search_entry_limit != 0)
+                .then(|| preferences.search_entry_limit as usize),
+        }
+    }
+
     pub fn filter_include_subfolders(&self) -> bool {
         self.preferences.borrow().filter_include_subfolders
     }
@@ -971,6 +1186,15 @@ impl PreferenceManager {
         }
     }
 
+    pub fn show_thumbnails(&self) -> bool {
+        self.preferences.borrow().show_thumbnails
+    }
+
+    pub fn set_show_thumbnails(&self, enabled: bool) {
+        self.preferences.borrow_mut().show_thumbnails = enabled;
+        self.save_preferences();
+    }
+
     pub fn thumbnail_workers(&self) -> usize {
         self.preferences.borrow().thumbnail_workers
     }
@@ -1027,13 +1251,77 @@ impl PreferenceManager {
         self.save_preferences();
     }
 
-    pub fn auto_refresh_interval(&self) -> u32 {
-        self.preferences.borrow().auto_refresh_interval
+    pub fn list_column_order(&self) -> Vec<ListColumnId> {
+        sanitize_list_column_order(&self.preferences.borrow().list_column_order)
     }
 
-    pub fn set_auto_refresh_interval(&self, secs: u32) {
-        self.preferences.borrow_mut().auto_refresh_interval =
-            normalized_auto_refresh_interval(secs);
+    pub fn set_list_column_order(&self, order: Vec<ListColumnId>) {
+        self.preferences.borrow_mut().list_column_order = sanitize_list_column_order(&order);
+        self.save_preferences();
+    }
+
+    pub fn list_hidden_columns(&self) -> Vec<ListColumnId> {
+        sanitize_list_hidden_columns(&self.preferences.borrow().list_hidden_columns)
+    }
+
+    pub fn set_list_hidden_columns(&self, hidden: Vec<ListColumnId>) {
+        self.preferences.borrow_mut().list_hidden_columns = sanitize_list_hidden_columns(&hidden);
+        self.save_preferences();
+    }
+
+    pub fn is_list_column_visible(&self, column: ListColumnId) -> bool {
+        if column == ListColumnId::Name {
+            return true;
+        }
+        !self.list_hidden_columns().contains(&column)
+    }
+
+    pub fn set_list_column_visible(&self, column: ListColumnId, visible: bool) {
+        if column == ListColumnId::Name {
+            return;
+        }
+        let mut hidden = self.list_hidden_columns();
+        if visible {
+            hidden.retain(|col| *col != column);
+        } else if !hidden.contains(&column) {
+            hidden.push(column);
+        }
+        self.set_list_hidden_columns(hidden);
+    }
+
+    pub fn swap_list_columns(&self, col1: ListColumnId, col2: ListColumnId) {
+        let mut order = self.list_column_order();
+        let pos1 = order.iter().position(|col| *col == col1);
+        let pos2 = order.iter().position(|col| *col == col2);
+        if let (Some(p1), Some(p2)) = (pos1, pos2) {
+            order.swap(p1, p2);
+            self.set_list_column_order(order);
+        }
+    }
+
+    pub fn reset_list_columns(&self) {
+        {
+            let mut prefs = self.preferences.borrow_mut();
+            prefs.list_column_order = default_list_column_order();
+            prefs.list_hidden_columns.clear();
+        }
+        self.save_preferences();
+    }
+
+    pub fn list_visible_columns(&self) -> Vec<ListColumnId> {
+        let hidden = self.list_hidden_columns();
+        self.list_column_order()
+            .into_iter()
+            .filter(|col| *col == ListColumnId::Name || !hidden.contains(col))
+            .collect()
+    }
+
+    pub fn watch_network_folders(&self) -> bool {
+        self.preferences.borrow().watch_network_folders
+    }
+
+    pub fn set_watch_network_folders(&self, enabled: bool) {
+        self.preferences.borrow_mut().watch_network_folders = enabled;
         self.save_preferences();
     }
 
@@ -1200,18 +1488,44 @@ impl PreferenceManager {
     }
 
     pub fn browser_density(&self) -> super::browser_modes::BrowserDensity {
-        match self.preferences.borrow().browser_density.as_str() {
-            "airy" => super::browser_modes::BrowserDensity::Airy,
-            _ => super::browser_modes::BrowserDensity::Compact,
-        }
+        let preferences = self.preferences.borrow();
+        stored_density(
+            &preferences.browser_density,
+            preferences.browser_density_custom_px,
+        )
     }
 
     pub fn set_browser_density(&self, density: super::browser_modes::BrowserDensity) {
-        self.preferences.borrow_mut().browser_density = match density {
-            super::browser_modes::BrowserDensity::Compact => "compact",
-            super::browser_modes::BrowserDensity::Airy => "airy",
+        {
+            let mut preferences = self.preferences.borrow_mut();
+            let preferences = &mut *preferences;
+            store_density(
+                density,
+                &mut preferences.browser_density,
+                &mut preferences.browser_density_custom_px,
+            );
         }
-        .to_owned();
+        self.save_preferences();
+    }
+
+    pub fn frame_density(&self) -> super::browser_modes::FrameDensity {
+        let preferences = self.preferences.borrow();
+        stored_density(
+            &preferences.frame_density,
+            preferences.frame_density_custom_px,
+        )
+    }
+
+    pub fn set_frame_density(&self, density: super::browser_modes::FrameDensity) {
+        {
+            let mut preferences = self.preferences.borrow_mut();
+            let preferences = &mut *preferences;
+            store_density(
+                density,
+                &mut preferences.frame_density,
+                &mut preferences.frame_density_custom_px,
+            );
+        }
         self.save_preferences();
     }
 
@@ -1263,6 +1577,22 @@ impl PreferenceManager {
             return;
         }
         self.preferences.borrow_mut().corner_roundness = roundness;
+        self.save_preferences();
+    }
+
+    /// The chosen interface font family; `None` keeps the bundled default.
+    pub fn interface_font(&self) -> Option<String> {
+        self.preferences.borrow().interface_font.clone()
+    }
+
+    pub fn set_interface_font(&self, family: Option<String>) {
+        let family = family
+            .map(|family| family.trim().to_owned())
+            .filter(|family| !family.is_empty());
+        if self.interface_font() == family {
+            return;
+        }
+        self.preferences.borrow_mut().interface_font = family;
         self.save_preferences();
     }
 
@@ -1526,37 +1856,52 @@ impl PreferenceManager {
         self.persistence_dirty.set(true);
         let contents =
             toml::to_string_pretty(&*self.preferences.borrow()).map_err(io::Error::other);
-        let result = contents.and_then(|contents| {
-            self.save_notices
-                .write(&path, &contents, crate::storage::atomic_write_config)
-        });
-        if result.is_ok() {
-            self.persistence_dirty.set(false);
-            self.settings_synced.set(file_stamp(&path));
+        if let Ok(contents) = &contents {
+            self.queue_settings_save(path.clone(), contents.as_bytes().to_vec());
         }
         if changed {
             self.changes.notify(self);
         }
         // Reported after bindings apply, and whether or not anything changed,
         // because a retry with an unchanged value can fail too.
-        if let Err(error) = result {
+        if let Err(error) = contents {
             self.save_notices.write_failed(&path, &error);
         }
     }
-}
 
-type FileStamp = (u64, i64, i64, u64);
+    fn queue_settings_save(&self, path: PathBuf, contents: Vec<u8>) {
+        let generation = self.saves_requested.get() + 1;
+        self.saves_requested.set(generation);
+        let saved = writer::save(path.clone(), Some(contents), Policy::Config, None);
+        let this = self.this.clone();
+        glib::MainContext::default().spawn_local(async move {
+            let result = saved
+                .await
+                .unwrap_or_else(|_| Err(io::Error::from_raw_os_error(libc::ECANCELED)));
+            if let Some(manager) = this.upgrade() {
+                manager.settings_saved(generation, &path, result);
+            }
+        });
+    }
 
-/// Tells this process's last write or read of a file apart from another
-/// process's later write.
-fn file_stamp(path: &Path) -> Option<FileStamp> {
-    let metadata = fs::metadata(path).ok()?;
-    Some((
-        metadata.ino(),
-        metadata.mtime(),
-        metadata.mtime_nsec(),
-        metadata.len(),
-    ))
+    fn settings_saved(&self, generation: u64, path: &Path, result: io::Result<()>) {
+        self.saves_finished
+            .set(self.saves_finished.get().max(generation));
+        if generation != self.saves_requested.get() {
+            return;
+        }
+        match result {
+            Ok(()) => {
+                self.persistence_dirty.set(false);
+                self.save_notices.saved();
+            }
+            Err(error) => self.save_notices.write_failed(path, &error),
+        }
+    }
+
+    fn settings_save_pending(&self) -> bool {
+        self.saves_finished.get() < self.saves_requested.get()
+    }
 }
 
 fn read_state_file(path: &Path) -> io::Result<Option<String>> {
@@ -1571,7 +1916,11 @@ fn read_preferences() -> io::Result<Preferences> {
     let Some(contents) = read_state_file(&settings_path())? else {
         return Ok(Preferences::default());
     };
-    let table: toml::Table = toml::from_str(&contents)
+    parse_preferences(&contents)
+}
+
+fn parse_preferences(contents: &str) -> io::Result<Preferences> {
+    let table: toml::Table = toml::from_str(contents)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
     match table.clone().try_into() {
         Ok(preferences) => Ok(preferences),

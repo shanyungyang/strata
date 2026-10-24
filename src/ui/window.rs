@@ -19,11 +19,11 @@ use gtk::{
 use crate::{
     adapters::{
         LocalFileSource, LocalOperationProvider, RevealRequest, location_for_file,
-        mount_can_unplug, volume_can_unplug,
+        mount_can_unplug, mount_lanes, probes, volume_can_unplug,
     },
     app::{Browser, BrowserEvent},
     model::Location,
-    services::sanitize_uri_credentials,
+    services::LocationValidationError,
 };
 
 use super::{
@@ -32,7 +32,7 @@ use super::{
         arm_spring_load_navigation, file_drag_hover_target, file_drop_action, file_drop_commit,
         locations_from_file_list_value, prepare_file_drop_target, show_error_dialog,
     },
-    browser_modes::{BrowserDensity, BrowserMode},
+    browser_modes::BrowserMode,
     controls::{ModalTone, focus_button, message_dialog_description, message_dialog_layout},
     keys::{
         KeyPress,
@@ -49,19 +49,26 @@ use super::{
 
 mod bookmarks;
 mod composition;
+mod density_slider;
 mod device_labels;
 mod device_release;
 mod devices;
 mod drive_dialogs;
 mod drive_ops;
 mod keyboard;
+mod network_location;
 mod open_argument;
+mod pinned_drop;
 mod sidebar;
+mod sidebar_drop_feedback;
 mod unlock_argument;
 mod volume_password;
 
+#[cfg(test)]
+pub(super) use devices::offer_removable_destinations_for_test;
 pub(super) use devices::{
-    RemovableDestination, removable_destinations, resolve_removable_destination,
+    RemovableDestination, RemovableWatch, removable_destination_root, removable_destinations,
+    send_to_recent_folders, watch_removable_destinations,
 };
 pub(in crate::ui) use keyboard::{ChooserKeys, ChooserPolicy, edit_focused_text};
 
@@ -300,6 +307,7 @@ pub(super) fn present_target(
     crate::assets::register_icon_theme();
     let _theme_manager = super::theme::ThemeManager::shared();
     let preference_manager = super::preferences::PreferenceManager::shared();
+    super::actions::shared();
     tracing::debug!(
         elapsed_ms = present_started.elapsed().as_millis() as u64,
         "present theme and styles ready"
@@ -318,7 +326,6 @@ pub(super) fn present_target(
     crate::metrics::mark_window_presented();
     if auto_navigate {
         let restore = restore_tabs && location.is_none();
-        let pending_location = location.unwrap_or_else(|| startup_location(&preference_manager));
         let idle_browser = browser.clone();
         glib::idle_add_local_once(move || {
             let started = std::time::Instant::now();
@@ -327,10 +334,14 @@ pub(super) fn present_target(
                     elapsed_ms = started.elapsed().as_millis() as u64,
                     "present tab session restored"
                 );
-            } else if selection.is_empty() {
-                idle_browser.navigate_location(pending_location);
             } else {
-                idle_browser.reveal_locations(pending_location, selection, properties);
+                match location {
+                    Some(location) if !selection.is_empty() => {
+                        idle_browser.reveal_locations(location, selection, properties);
+                    }
+                    Some(location) => idle_browser.navigate_location(location),
+                    None => open_default_folder(&idle_browser.browser(), &preference_manager),
+                }
             }
             tracing::debug!(
                 elapsed_ms = started.elapsed().as_millis() as u64,
@@ -758,6 +769,26 @@ pub(super) fn build_appearance_menu(
             }
         });
     }
+    let (customize_columns, _, _) = appearance_option(
+        crate::assets::icons::COLUMNS,
+        "Customize columns…",
+        false,
+        true,
+        gtk::AccessibleRole::MenuItem,
+    );
+    customize_columns.set_visible(current_mode == BrowserMode::List);
+    {
+        let view = view.downgrade();
+        let popover_weak = popover_weak.clone();
+        customize_columns.connect_clicked(move |_| {
+            if let Some(popover) = popover_weak.upgrade() {
+                popover.popdown();
+            }
+            if let Some(view) = view.upgrade() {
+                view.open_list_columns_popover();
+            }
+        });
+    }
     for (button, mode) in [
         (&columns, BrowserMode::Columns),
         (&icons, BrowserMode::Icons),
@@ -790,6 +821,7 @@ pub(super) fn build_appearance_menu(
         let list_check = list_check.clone();
         let group_by_type = group_by_type.clone();
         let column_sizes = column_sizes.clone();
+        let customize_columns = customize_columns.clone();
         let button_icon = button_icon.clone();
         view.connect_view_mode_changed(move |mode| {
             columns_check.set_visible(mode == BrowserMode::Columns);
@@ -797,6 +829,7 @@ pub(super) fn build_appearance_menu(
             list_check.set_visible(mode == BrowserMode::List);
             group_by_type.set_sensitive(mode.supports_type_grouping());
             column_sizes.set_visible(mode == BrowserMode::Columns);
+            customize_columns.set_visible(mode == BrowserMode::List);
             crate::assets::set_primary_icon(&button_icon, browser_mode_icon(mode));
         });
     }
@@ -867,56 +900,21 @@ pub(super) fn build_appearance_menu(
     });
     content.append(&preview_toggle);
 
+    let hidden_files_shown = preferences.sort_preferences().show_hidden;
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     append_menu_heading(&content, &crate::i18n::tr("DENSITY"));
-    let current_density = preferences.browser_density();
-    let hidden_files_shown = preferences.sort_preferences().show_hidden;
-    let (compact, compact_check, _) = appearance_option(
-        crate::assets::icons::ROWS,
-        "Compact",
-        current_density == BrowserDensity::Compact,
-        true,
-        gtk::AccessibleRole::MenuItemRadio,
-    );
-    let (airy, airy_check, _) = appearance_option(
-        crate::assets::icons::ROWS,
-        "Airy",
-        current_density == BrowserDensity::Airy,
-        true,
-        gtk::AccessibleRole::MenuItemRadio,
-    );
-    preferences.bind_preference(
-        &compact_check,
+    content.append(&density_slider::density_slider(
+        &preferences,
+        "Frame",
+        PreferenceManager::frame_density,
+        PreferenceManager::set_frame_density,
+    ));
+    content.append(&density_slider::density_slider(
+        &preferences,
+        "Content",
         PreferenceManager::browser_density,
-        |widget, density| widget.set_visible(density == BrowserDensity::Compact),
-    );
-    preferences.bind_preference(
-        &airy_check,
-        PreferenceManager::browser_density,
-        |widget, density| widget.set_visible(density == BrowserDensity::Airy),
-    );
-    {
-        let preferences = preferences.clone();
-        let popover_weak = popover_weak.clone();
-        compact.connect_clicked(move |_| {
-            preferences.set_browser_density(BrowserDensity::Compact);
-            if let Some(popover) = popover_weak.upgrade() {
-                popover.popdown();
-            }
-        });
-    }
-    {
-        let preferences = preferences.clone();
-        let popover_weak = popover_weak.clone();
-        airy.connect_clicked(move |_| {
-            preferences.set_browser_density(BrowserDensity::Airy);
-            if let Some(popover) = popover_weak.upgrade() {
-                popover.popdown();
-            }
-        });
-    }
-    content.append(&compact);
-    content.append(&airy);
+        PreferenceManager::set_browser_density,
+    ));
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     append_menu_heading(&content, &crate::i18n::tr("TEXT SIZE"));
@@ -957,6 +955,7 @@ pub(super) fn build_appearance_menu(
 
     content.append(&gtk::Separator::new(gtk::Orientation::Horizontal));
     content.append(&group_by_type);
+    content.append(&customize_columns);
     content.append(&column_sizes);
     let (hidden, hidden_check, hidden_icon) = appearance_option_with_shortcut(
         if hidden_files_shown {
@@ -1096,6 +1095,7 @@ fn append_menu_heading(container: &gtk::Box, text: &str) {
 }
 
 type RailListener = Rc<dyn Fn(bool)>;
+type SidebarReorder = Rc<dyn Fn(&Rc<SidebarState>, &str, bool) -> bool>;
 
 pub(super) struct SidebarState {
     widget: gtk::Box,
@@ -1110,7 +1110,7 @@ pub(super) struct SidebarState {
     place_rows: RefCell<Vec<(Location, gtk::Button)>>,
     trash_contents: Cell<TrashContents>,
     trash_menu_rows: RefCell<Option<TrashMenuRows>>,
-    trash_monitor: RefCell<Option<gio::FileMonitor>>,
+    trash_monitor: RefCell<Option<crate::services::LoadHandle>>,
     trash_probe_running: Cell<bool>,
     trash_probe_pending: Cell<bool>,
     local_only: bool,
@@ -1126,6 +1126,10 @@ pub(super) struct SidebarState {
     keycaps: RefCell<Vec<gtk::Label>>,
     keycaps_shown: Cell<bool>,
     visible_pins: RefCell<Vec<Location>>,
+    /// The separator, heading and drop gap of a Pinned section with no pins.
+    empty_pinned_section: RefCell<Vec<glib::WeakRef<gtk::Widget>>>,
+    file_drag_over: Cell<bool>,
+    drop_feedback: Rc<sidebar_drop_feedback::SidebarDropFeedback>,
 }
 
 /// Rows of the Trash sidebar context menu that only make sense while Trash holds items.
@@ -1252,9 +1256,7 @@ impl SidebarView {
 
     pub(super) fn disconnect(&self) {
         unparent_sidebar_popovers(self.state.widget.upcast_ref());
-        if let Some(monitor) = self.state.trash_monitor.take() {
-            monitor.cancel();
-        }
+        self.state.trash_monitor.take();
         self.bookmark_watch.take();
         for handler in self.handlers.take() {
             self.state.volume_monitor.disconnect(handler);
@@ -1301,6 +1303,7 @@ impl SidebarState {
             unparent_sidebar_popovers(&child);
             self.widget.remove(&child);
         }
+        self.drop_feedback.reset();
         self.place_rows.borrow_mut().clear();
         self.keycaps.borrow_mut().clear();
         self.visible_pins.borrow_mut().clear();
@@ -1552,12 +1555,10 @@ impl SidebarState {
                     location.clone(),
                 );
                 self.add_keycap(&row, &place_keycap(super::keys::bindings::GO_HOME));
-                if !self.local_only {
-                    self.attach_place_context_menu(&row, location, |state| {
-                        state.preference_manager.set_sidebar_show_home(false);
-                    });
-                    self.make_place_reorderable(&row, place);
-                }
+                self.attach_place_context_menu(&row, location, |state| {
+                    state.preference_manager.set_sidebar_show_home(false);
+                });
+                self.make_place_reorderable(&row, place);
             }
             "trash" => {
                 if !self.local_only && self.preference_manager.sidebar_show_trash() {
@@ -1575,9 +1576,14 @@ impl SidebarState {
                     location.clone(),
                 );
                 self.add_keycap(&row, &place_keycap(super::keys::bindings::GO_NETWORK));
-                self.attach_place_context_menu(&row, location, |state| {
-                    state.preference_manager.set_sidebar_show_network(false);
-                });
+                self.attach_place_context_menu_with(
+                    &row,
+                    location,
+                    |state| {
+                        state.preference_manager.set_sidebar_show_network(false);
+                    },
+                    Some(network_location::menu_extra()),
+                );
                 self.make_place_reorderable(&row, place);
             }
             "recent" => {
@@ -1604,16 +1610,12 @@ impl SidebarState {
             && let Some(path) = glib::user_special_dir(directory)
                 .filter(|path| should_show_standard_place(place, path, &home_directory()))
         {
-            let row = if self.local_only {
-                self.append_place(icon, &crate::i18n::tr(name), Location::local(path))
-            } else {
-                self.append_reorderable_place(
-                    place,
-                    icon,
-                    &crate::i18n::tr(name),
-                    Location::local(path),
-                )
-            };
+            let row = self.append_reorderable_place(
+                place,
+                icon,
+                &crate::i18n::tr(name),
+                Location::local(path),
+            );
             if let Some(step) = standard_place_chord_key(place) {
                 self.add_keycap(&row, &place_keycap(step));
             }
@@ -1630,23 +1632,46 @@ impl SidebarState {
             .filter(|(_, (location, _))| !self.local_only || location.native_path().is_some())
             .map(|(index, (location, name))| (index, location.clone(), name.clone()))
             .collect::<Vec<_>>();
-        if !pinned.is_empty() {
-            if self.widget.first_child().is_some() {
-                self.append_separator();
+        let empty = pinned.is_empty();
+        let before_section = self.widget.last_child();
+        if self.widget.first_child().is_some() {
+            self.append_separator();
+        }
+        self.append_heading("PINNED");
+        let drag_cache = Rc::new(pinned_drop::FolderDragCache::new(self.local_only));
+        let mut previous = None;
+        for (ordinal, (index, location, name)) in pinned.into_iter().enumerate() {
+            pinned_drop::append_gap(self, previous, Some(location.clone()), &drag_cache);
+            previous = Some(location.clone());
+            self.visible_pins.borrow_mut().push(location.clone());
+            let row = self.append_pinned_place(index, &name, location);
+            if let Some(keycap) = pin_keycap(ordinal) {
+                self.add_keycap(&row, &keycap);
             }
-            self.append_heading("PINNED");
-            for (ordinal, (index, location, name)) in pinned.into_iter().enumerate() {
-                self.visible_pins.borrow_mut().push(location.clone());
-                let row = if self.local_only {
-                    let row = self.append_place(crate::assets::icons::FOLDER, &name, location);
-                    row.add_css_class("sidebar-pinned-row");
-                    row
-                } else {
-                    self.append_pinned_place(index, &name, location)
-                };
-                if let Some(keycap) = pin_keycap(ordinal) {
-                    self.add_keycap(&row, &keycap);
-                }
+        }
+        pinned_drop::append_gap(self, previous, None, &drag_cache);
+        let section = if empty {
+            let first = match before_section {
+                Some(widget) => widget.next_sibling(),
+                None => self.widget.first_child(),
+            };
+            std::iter::successors(first, gtk::Widget::next_sibling)
+                .inspect(|widget| widget.set_visible(self.file_drag_over.get()))
+                .map(|widget| widget.downgrade())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        self.empty_pinned_section.replace(section);
+    }
+
+    /// With nothing pinned, the Pinned section is only a drop target, so it
+    /// shows just while files are dragged over the sidebar.
+    pub(super) fn set_file_drag_over(&self, over: bool) {
+        self.file_drag_over.set(over);
+        for widget in self.empty_pinned_section.borrow().iter() {
+            if let Some(widget) = widget.upgrade() {
+                widget.set_visible(over);
             }
         }
     }
@@ -1729,8 +1754,7 @@ impl SidebarState {
         }
         crate::ui::accessibility::set_description(&row, Some(&location.display_path()));
         if device_release::is_pending(&ids) {
-            self.widget
-                .append(&device_release::pending_device_shell(&row));
+            self.append_sidebar_row(&device_release::pending_device_shell(&row));
             return Some(ids);
         }
         self.bind_place_row(&row, location, PlaceNavigation::Validate);
@@ -1788,41 +1812,88 @@ impl SidebarState {
     }
 
     fn pin_location(self: &Rc<Self>, location: Location, name: String) {
-        self.update_pinned_places(|places| {
-            if pin_status(places, &location) != PinStatus::Available {
-                return false;
-            }
-            places.push((location, name));
-            true
-        });
+        self.update_pinned_places(
+            move |places| {
+                if pin_status(places, &location) != PinStatus::Available {
+                    return false;
+                }
+                places.push((location.clone(), name.clone()));
+                true
+            },
+            |_| {},
+        );
     }
 
     fn unpin_location(self: &Rc<Self>, location: &Location) {
-        self.update_pinned_places(|places| remove_pinned_place(places, location));
+        let location = location.clone();
+        self.update_pinned_places(move |places| remove_pinned_place(places, &location), |_| {});
+    }
+
+    fn pin_folders_into(
+        self: &Rc<Self>,
+        folders: &[(Location, String)],
+        (after, before): PinGap<'_>,
+        done: impl FnOnce(bool) + 'static,
+    ) {
+        let folders = folders.to_vec();
+        let (after, before) = (after.cloned(), before.cloned());
+        self.update_pinned_places(
+            move |places| {
+                pin_gap_index(places, (after.as_ref(), before.as_ref()))
+                    .is_some_and(|index| pin_locations_at(places, &folders, index))
+            },
+            done,
+        );
+    }
+
+    fn reorder_pinned_into(
+        self: &Rc<Self>,
+        source: &Location,
+        (after, before): PinGap<'_>,
+        done: impl FnOnce(bool) + 'static,
+    ) {
+        let source = source.clone();
+        let (after, before) = (after.cloned(), before.cloned());
+        self.update_pinned_places(
+            move |places| {
+                let Some(source) = places.iter().position(|(location, _)| *location == source)
+                else {
+                    return false;
+                };
+                pin_gap_index(places, (after.as_ref(), before.as_ref()))
+                    .is_some_and(|index| move_pinned_place(places, source, index))
+            },
+            done,
+        );
     }
 
     fn update_pinned_places(
         self: &Rc<Self>,
-        change: impl FnOnce(&mut Vec<(Location, String)>) -> bool,
+        change: impl Fn(&mut Vec<(Location, String)>) -> bool + Send + 'static,
+        done: impl FnOnce(bool) + 'static,
     ) {
         // Merge into the shared file, never this window's stale snapshot.
-        let result = load_pinned_places().and_then(|mut places| {
-            if change(&mut places) {
-                save_pinned_places(&places)?;
+        let edit = move |contents: &[u8]| {
+            let mut places = crate::adapters::bookmarks::parse_pinned_places(contents);
+            change(&mut places)
+                .then(|| crate::adapters::bookmarks::serialize_pinned_places(&places).into_bytes())
+        };
+        let weak = Rc::downgrade(self);
+        glib::MainContext::default().spawn_local(async move {
+            match crate::adapters::bookmarks::update(edit).await {
+                Ok(changed) => done(changed),
+                Err(error) => {
+                    if let Some(state) = weak.upgrade() {
+                        show_error_dialog(
+                            &state.view.widget(),
+                            &crate::i18n::tr("Unable to update pinned folders"),
+                            &crate::services::io_error_message(&error),
+                        );
+                    }
+                    done(false);
+                }
             }
-            Ok(places)
         });
-        match result {
-            Ok(places) => {
-                self.pinned_places.replace(places);
-                self.rebuild();
-            }
-            Err(error) => show_error_dialog(
-                &self.view.widget(),
-                &crate::i18n::tr("Unable to update pinned folders"),
-                &crate::services::io_error_message(&error),
-            ),
-        }
     }
     fn event_changes_active_place(event: &BrowserEvent) -> bool {
         matches!(
@@ -1918,18 +1989,21 @@ impl SidebarState {
         if self.trash_monitor.borrow().is_some() {
             return;
         }
-        let trash = gio::File::for_uri("trash:///");
-        let Ok(monitor) =
-            trash.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
-        else {
-            return;
-        };
-        let weak = Rc::downgrade(self);
-        monitor.connect_changed(move |_, _, _, _| {
-            if let Some(state) = weak.upgrade() {
-                state.refresh_trash_contents();
-            }
-        });
+        let (changed, live) = (Rc::downgrade(self), Rc::downgrade(self));
+        let monitor = crate::adapters::watch(
+            &Location::uri("trash:///"),
+            crate::adapters::Watched::Folder,
+            move |_, _| {
+                if let Some(state) = changed.upgrade() {
+                    state.refresh_trash_contents();
+                }
+            },
+            move || {
+                if let Some(state) = live.upgrade() {
+                    state.refresh_trash_contents();
+                }
+            },
+        );
         *self.trash_monitor.borrow_mut() = Some(monitor);
     }
 
@@ -1939,8 +2013,8 @@ impl SidebarState {
         crate::ui::accessibility::set_description(&row, Some("recent:///"));
         self.add_keycap(&row, &place_keycap(super::keys::bindings::GO_RECENT));
         self.bind_place_row(&row, location, PlaceNavigation::Direct);
+        self.append_sidebar_row(&row);
         self.make_place_reorderable(&row, "recent");
-        self.widget.append(&row);
     }
 
     fn append_trash_place(self: &Rc<Self>) {
@@ -2029,14 +2103,14 @@ impl SidebarState {
             popover.popup();
         });
         row.add_controller(context);
+        self.append_sidebar_row(&row);
         self.make_place_reorderable(&row, "trash");
-        self.widget.append(&row);
     }
 
     fn make_reorderable(
         self: &Rc<Self>,
         row: &gtk::Button,
-        payload: impl Fn() -> String + 'static,
+        payload: String,
         on_drop: impl Fn(&Rc<Self>, &str, bool) -> bool + 'static,
     ) {
         row.add_css_class("reorderable");
@@ -2045,8 +2119,18 @@ impl SidebarState {
         let drag = gtk::DragSource::builder()
             .actions(gtk::gdk::DragAction::MOVE)
             .build();
+        let weak_state = Rc::downgrade(self);
+        let source_payload = payload.clone();
         drag.connect_prepare(move |_, _, _| {
-            Some(gtk::gdk::ContentProvider::for_value(&payload().to_value()))
+            let payload = &source_payload;
+            let content = gtk::gdk::ContentProvider::for_value(&payload.to_value());
+            if let Some(index) = parse_pinned_drag_source(payload)
+                && let Some(state) = weak_state.upgrade()
+                && let Some(place) = state.pinned_places.borrow().get(index)
+            {
+                pinned_drop::start_reorder(&content, place.clone());
+            }
+            Some(content)
         });
         drag.connect_drag_begin(move |drag, _| {
             if let Some(row) = drag.widget() {
@@ -2054,7 +2138,10 @@ impl SidebarState {
                 row.set_cursor_from_name(Some("grabbing"));
             }
         });
+        let end_feedback = self.drop_feedback.clone();
         drag.connect_drag_end(move |drag, _, _| {
+            pinned_drop::clear_reorder();
+            end_feedback.reset();
             if let Some(row) = drag.widget() {
                 row.remove_css_class("dragging");
                 row.set_cursor_from_name(Some("pointer"));
@@ -2062,7 +2149,49 @@ impl SidebarState {
         });
         row.add_controller(drag);
 
+        let on_drop: SidebarReorder = Rc::new(on_drop);
+        self.install_reorder_target(row, payload.clone(), None, on_drop.clone());
+        if parse_pinned_drag_source(&payload).is_none() {
+            for after in [false, true] {
+                if let Some(gap) = self.insert_reorder_gap(row.upcast_ref(), after) {
+                    self.install_reorder_target(
+                        &gap,
+                        payload.clone(),
+                        Some(after),
+                        on_drop.clone(),
+                    );
+                }
+            }
+        }
+    }
+
+    fn insert_reorder_gap(&self, row: &gtk::Widget, after: bool) -> Option<gtk::Box> {
+        let neighbour = if after {
+            row.next_sibling()
+        } else {
+            row.prev_sibling()
+        };
+        if neighbour
+            .as_ref()
+            .is_some_and(sidebar_drop_feedback::is_gap)
+        {
+            return None;
+        }
+        let gap = sidebar_drop_feedback::row_gap(None);
+        let previous = if after { Some(row.clone()) } else { neighbour };
+        self.widget.insert_child_after(&gap, previous.as_ref());
+        Some(gap)
+    }
+
+    fn install_reorder_target(
+        self: &Rc<Self>,
+        widget: &impl IsA<gtk::Widget>,
+        payload: String,
+        fixed_after: Option<bool>,
+        on_drop: SidebarReorder,
+    ) {
         let drop = gtk::DropTarget::new(String::static_type(), gtk::gdk::DragAction::MOVE);
+        drop.set_preload(true);
         drop.connect_accept(|_, offered| {
             accepts_sidebar_reorder_payload(
                 offered.formats().contains_type(String::static_type()),
@@ -2071,21 +2200,70 @@ impl SidebarState {
                     .contains_type(gtk::gdk::FileList::static_type()),
             )
         });
+        let hover_y = Rc::new(Cell::new(0.0));
+        let enter_y = hover_y.clone();
+        let enter_payload = payload.clone();
+        let enter_feedback = self.drop_feedback.clone();
+        drop.connect_enter(move |target, _, y| {
+            enter_y.set(y);
+            if let Some(row) = target.widget() {
+                enter_feedback.enter(&row);
+            }
+            sidebar_reorder_feedback(target, &enter_payload, y, &enter_feedback)
+        });
+        let motion_y = hover_y.clone();
+        let motion_payload = payload.clone();
+        let motion_feedback = self.drop_feedback.clone();
+        drop.connect_motion(move |target, _, y| {
+            motion_y.set(y);
+            sidebar_reorder_feedback(target, &motion_payload, y, &motion_feedback)
+        });
+        let value_payload = payload.clone();
+        let value_feedback = self.drop_feedback.clone();
+        drop.connect_value_notify(move |target| {
+            if let Some(offered) = target.current_drop()
+                && target
+                    .widget()
+                    .is_some_and(|row| value_feedback.is_current(&row))
+            {
+                let action = sidebar_reorder_feedback(
+                    target,
+                    &value_payload,
+                    hover_y.get(),
+                    &value_feedback,
+                );
+                offered.status(action, action);
+            }
+        });
+        let leave_feedback = self.drop_feedback.clone();
+        drop.connect_leave(move |target| {
+            if let Some(row) = target.widget() {
+                leave_feedback.leave(&row);
+            }
+        });
         let weak_state = Rc::downgrade(self);
+        let drop_feedback = self.drop_feedback.clone();
         drop.connect_drop(move |target, value, _, y| {
-            let Ok(source) = value.get::<String>() else {
-                return false;
-            };
             let Some(row) = target.widget() else {
                 return false;
             };
-            let after = y >= f64::from(row.height()) / 2.0;
+            drop_feedback.leave(&row);
+            let Ok(source) = value.get::<String>() else {
+                return false;
+            };
+            if source == payload && fixed_after.is_some() {
+                return true;
+            }
+            if !sidebar_reorder_matches(&source, &payload) {
+                return false;
+            }
+            let after = fixed_after.unwrap_or_else(|| y >= f64::from(row.height()) / 2.0);
             if let Some(state) = weak_state.upgrade() {
                 return on_drop(&state, &source, after);
             }
             false
         });
-        row.add_controller(drop);
+        widget.add_controller(drop);
     }
 
     fn append_reorderable_place(
@@ -2112,26 +2290,19 @@ impl SidebarState {
             }
         });
 
+        self.append_sidebar_row(&row);
         self.make_place_reorderable(&row, id);
-        self.widget.append(&row);
         row
     }
 
     fn make_place_reorderable(self: &Rc<Self>, row: &gtk::Button, id: &'static str) {
-        if self.local_only {
-            return;
-        }
-        self.make_reorderable(
-            row,
-            move || id.to_string(),
-            move |state, source, after| {
-                if source.starts_with(PINNED_DRAG_PREFIX) {
-                    return false;
-                }
-                state.reorder_place(source, id, after);
-                true
-            },
-        );
+        self.make_reorderable(row, id.to_owned(), move |state, source, after| {
+            if source.starts_with(PINNED_DRAG_PREFIX) {
+                return false;
+            }
+            state.reorder_place(source, id, after);
+            true
+        });
     }
 
     fn reorder_place(self: &Rc<Self>, source: &str, target: &str, after: bool) {
@@ -2156,16 +2327,19 @@ impl SidebarState {
                 _ => return,
             }
         };
-        self.update_pinned_places(|places| {
-            let position =
-                |location: &Location| places.iter().position(|(pinned, _)| pinned == location);
-            match (position(&source), position(&target)) {
-                (Some(source), Some(target)) => {
-                    reorder_pinned_places(places, source, target, after)
+        self.update_pinned_places(
+            move |places| {
+                let position =
+                    |location: &Location| places.iter().position(|(pinned, _)| pinned == location);
+                match (position(&source), position(&target)) {
+                    (Some(source), Some(target)) => {
+                        reorder_pinned_places(places, source, target, after)
+                    }
+                    _ => false,
                 }
-                _ => false,
-            }
-        });
+            },
+            |_| {},
+        );
     }
 
     fn append_separator(&self) {
@@ -2206,15 +2380,14 @@ impl SidebarState {
         }
         let ids = device_release::ids_for_volume(&volume);
         if device_release::is_pending(&ids) {
-            self.widget
-                .append(&device_release::pending_device_shell(&row));
+            self.append_sidebar_row(&device_release::pending_device_shell(&row));
             return Some(ids);
         }
         if let Some(location) = mounted_location {
             self.place_rows
                 .borrow_mut()
                 .push((location.clone(), row.clone()));
-            install_sidebar_file_drop(&self.view, &row, location);
+            install_sidebar_file_drop(self, &row, location);
         }
         let weak_browser = Rc::downgrade(&self.browser);
         let sidebar = self.widget.clone();
@@ -2300,8 +2473,7 @@ impl SidebarState {
 
     fn append_release_ghost(&self, key: &device_release::ReleaseKey) {
         let row = sidebar_button(crate::assets::icons::HARD_DRIVE, &key.display_name);
-        self.widget
-            .append(&device_release::pending_device_shell(&row));
+        self.append_sidebar_row(&device_release::pending_device_shell(&row));
     }
 
     fn append_password_drive(&self, drive: gio::Drive) -> Option<device_release::DeviceIds> {
@@ -2310,8 +2482,7 @@ impl SidebarState {
         let row = sidebar_button(crate::assets::icons::HARD_DRIVE, &name);
         crate::ui::accessibility::set_description(&row, Some(&name));
         if device_release::is_pending(&ids) {
-            self.widget
-                .append(&device_release::pending_device_shell(&row));
+            self.append_sidebar_row(&device_release::pending_device_shell(&row));
             return Some(ids);
         }
         let sidebar = self.widget.clone();
@@ -2474,8 +2645,24 @@ impl SidebarState {
         location: Location,
         on_unpin: impl Fn(&Rc<Self>) + 'static,
     ) {
+        self.attach_place_context_menu_with(row, location, on_unpin, None);
+    }
+
+    /// Like [`Self::attach_place_context_menu`], with `extra` above the standard items.
+    fn attach_place_context_menu_with(
+        self: &Rc<Self>,
+        row: &gtk::Button,
+        location: Location,
+        on_unpin: impl Fn(&Rc<Self>) + 'static,
+        extra: Option<PlaceMenuExtra>,
+    ) {
         let menu = super::accessibility::menu_box();
         menu.add_css_class("folder-context-menu");
+        let extra_item = extra.map(|extra| {
+            let button = sidebar_context_option(extra.icon, extra.label, false);
+            menu.append(&button);
+            (button, extra.action)
+        });
         let unpin = sidebar_context_option(crate::assets::icons::PIN, "Unpin", false);
         let properties = sidebar_context_option(crate::assets::icons::INFO, "Properties", false);
         menu.append(&unpin);
@@ -2492,6 +2679,19 @@ impl SidebarState {
             .build();
         popover.add_css_class("folder-context-popover");
         popover.set_parent(row);
+
+        if let Some((button, action)) = extra_item {
+            let popover = popover.downgrade();
+            let weak_state = Rc::downgrade(self);
+            button.connect_clicked(move |_| {
+                if let Some(popover) = popover.upgrade() {
+                    popover.popdown();
+                }
+                if let Some(state) = weak_state.upgrade() {
+                    action(&state);
+                }
+            });
+        }
 
         if let Some((customize, path)) = customize {
             let weak_popover = popover.downgrade();
@@ -2554,7 +2754,7 @@ impl SidebarState {
     fn make_pinned_row_reorderable(self: &Rc<Self>, row: &gtk::Button, index: usize) {
         self.make_reorderable(
             row,
-            move || format!("{PINNED_DRAG_PREFIX}{index}"),
+            format!("{PINNED_DRAG_PREFIX}{index}"),
             move |state, source, after| {
                 let Some(source) = parse_pinned_drag_source(source) else {
                     return false;
@@ -2563,6 +2763,17 @@ impl SidebarState {
                 true
             },
         );
+    }
+
+    fn append_sidebar_row(&self, row: &impl IsA<gtk::Widget>) {
+        if self.widget.last_child().is_some_and(|previous| {
+            previous.has_css_class("sidebar-row")
+                || previous.has_css_class("sidebar-device")
+                || previous.has_css_class("sidebar-heading")
+        }) {
+            self.widget.append(&sidebar_drop_feedback::row_gap(None));
+        }
+        self.widget.append(row);
     }
 
     fn append_place(&self, icon: &str, name: &str, location: Location) -> gtk::Button {
@@ -2599,11 +2810,10 @@ impl SidebarState {
                     None,
                     None,
                 );
-                self.widget
-                    .append(&sidebar_device_row(&row, None, Some(&eject)));
+                self.append_sidebar_row(&sidebar_device_row(&row, None, Some(&eject)));
             }
             None => {
-                self.widget.append(&row);
+                self.append_sidebar_row(&row);
             }
         }
         row
@@ -2630,10 +2840,9 @@ impl SidebarState {
             attach_device_actions_menu(
                 row, &self.view, actions, on_crypto, on_release, on_mount, properties,
             );
-            self.widget
-                .append(&sidebar_device_row(row, lock.as_ref(), eject.as_ref()));
+            self.append_sidebar_row(&sidebar_device_row(row, lock.as_ref(), eject.as_ref()));
         } else {
-            self.widget.append(row);
+            self.append_sidebar_row(row);
         }
     }
 }
@@ -2642,25 +2851,51 @@ fn accepts_sidebar_reorder_payload(has_string: bool, has_file_list: bool) -> boo
     has_string && !has_file_list
 }
 
+fn sidebar_reorder_matches(source: &str, target: &str) -> bool {
+    source != target
+        && if parse_pinned_drag_source(target).is_some() {
+            parse_pinned_drag_source(source).is_some()
+        } else {
+            STANDARD_PLACE_IDS.contains(&source) && STANDARD_PLACE_IDS.contains(&target)
+        }
+}
+
+fn sidebar_reorder_feedback(
+    target: &gtk::DropTarget,
+    payload: &str,
+    y: f64,
+    feedback: &sidebar_drop_feedback::SidebarDropFeedback,
+) -> gtk::gdk::DragAction {
+    let Some(row) = target.widget() else {
+        return gtk::gdk::DragAction::empty();
+    };
+    if !feedback.is_current(&row) {
+        return gtk::gdk::DragAction::empty();
+    }
+    let Some(value) = target.value() else {
+        return gtk::gdk::DragAction::MOVE;
+    };
+    if !value.get::<String>().is_ok_and(|source| {
+        sidebar_reorder_matches(&source, payload)
+            || (source == payload && sidebar_drop_feedback::is_gap(&row))
+    }) {
+        return gtk::gdk::DragAction::empty();
+    }
+    feedback.reorder(&row, y >= f64::from(row.height()) / 2.0);
+    gtk::gdk::DragAction::MOVE
+}
+
 fn sidebar_accepts_file_drop(location: &Location) -> bool {
     location.native_path().is_some()
 }
 
-fn row_toggle_drop_highlight(row: &impl IsA<gtk::Widget>, hovered: bool) {
-    if hovered {
-        row.add_css_class("drop-destination");
-    } else {
-        row.remove_css_class("drop-destination");
-    }
-}
-
 fn install_sidebar_file_drop(
-    view: &BrowserView,
+    state: &SidebarState,
     row: &impl IsA<gtk::Widget>,
     destination: Location,
 ) {
     if destination == Location::uri("trash:///") {
-        install_sidebar_trash_drop(view, row);
+        install_sidebar_trash_drop(state, row);
         return;
     }
     if !sidebar_accepts_file_drop(&destination) {
@@ -2676,7 +2911,7 @@ fn install_sidebar_file_drop(
     });
     drop.set_propagation_phase(gtk::PropagationPhase::Capture);
     let spring_navigate: Rc<dyn Fn(Location)> = {
-        let view = view.downgrade();
+        let view = state.view.downgrade();
         let row = row.downgrade();
         Rc::new(move |location| {
             let Some(view) = view.upgrade() else {
@@ -2688,57 +2923,62 @@ fn install_sidebar_file_drop(
             }
         })
     };
-    let highlighted_row = row.downgrade();
     let state_for_enter = drop_state.clone();
     let navigate_for_enter = spring_navigate.clone();
+    let enter_feedback = state.drop_feedback.clone();
     drop.connect_enter(move |target, _, _| {
+        let Some(row) = target.widget() else {
+            return gtk::gdk::DragAction::empty();
+        };
+        let cancel_state = state_for_enter.clone();
+        enter_feedback.enter_folder(&row, move || cancel_state.cancel_spring_load_navigation());
         let action = file_drop_action(target, &state_for_enter);
         let hovered = file_drag_hover_target(&state_for_enter, target).is_some();
-        if let Some(row) = highlighted_row.upgrade() {
-            row_toggle_drop_highlight(&row, hovered);
-        }
+        enter_feedback.folder(&row, hovered);
         arm_spring_load_navigation(&state_for_enter, target, &navigate_for_enter);
         action
     });
-    let highlighted_row = row.downgrade();
     let state_for_motion = drop_state.clone();
     let navigate_for_motion = spring_navigate.clone();
+    let motion_feedback = state.drop_feedback.clone();
     drop.connect_motion(move |target, _, _| {
+        let Some(row) = target
+            .widget()
+            .filter(|row| motion_feedback.is_current(row))
+        else {
+            return gtk::gdk::DragAction::empty();
+        };
         let action = file_drop_action(target, &state_for_motion);
         let hovered = file_drag_hover_target(&state_for_motion, target).is_some();
-        if let Some(row) = highlighted_row.upgrade() {
-            row_toggle_drop_highlight(&row, hovered);
-        }
+        motion_feedback.folder(&row, hovered);
         arm_spring_load_navigation(&state_for_motion, target, &navigate_for_motion);
         action
     });
-    let highlighted_row = row.downgrade();
     let state_for_value = drop_state.clone();
     let navigate_for_value = spring_navigate.clone();
+    let value_feedback = state.drop_feedback.clone();
     drop.connect_value_notify(move |target| {
         if target.current_drop().is_none() {
             return;
         }
+        let Some(row) = target.widget().filter(|row| value_feedback.is_current(row)) else {
+            return;
+        };
         let hovered = file_drag_hover_target(&state_for_value, target).is_some();
-        if let Some(row) = highlighted_row.upgrade() {
-            row_toggle_drop_highlight(&row, hovered);
-        }
+        value_feedback.folder(&row, hovered);
         arm_spring_load_navigation(&state_for_value, target, &navigate_for_value);
     });
-    let highlighted_row = row.downgrade();
-    let state_for_leave = drop_state.clone();
-    drop.connect_leave(move |_| {
-        state_for_leave.cancel_spring_load_navigation();
-        if let Some(row) = highlighted_row.upgrade() {
-            row_toggle_drop_highlight(&row, false);
+    let leave_feedback = state.drop_feedback.clone();
+    drop.connect_leave(move |target| {
+        if let Some(row) = target.widget() {
+            leave_feedback.leave(&row);
         }
     });
-    let view = view.downgrade();
-    let highlighted_row = row.downgrade();
+    let view = state.view.downgrade();
+    let drop_feedback = state.drop_feedback.clone();
     drop.connect_drop(move |target, value, _, _| {
-        drop_state.cancel_spring_load_navigation();
-        if let Some(row) = highlighted_row.upgrade() {
-            row_toggle_drop_highlight(&row, false);
+        if let Some(row) = target.widget() {
+            drop_feedback.leave(&row);
         }
         let Some(view) = view.upgrade() else {
             return false;
@@ -2749,8 +2989,15 @@ fn install_sidebar_file_drop(
         if sources.is_empty() {
             return false;
         }
-        let commit = file_drop_commit(target, &destination, &sources, &drop_state);
-        view.commit_file_drop(destination.clone(), sources, commit);
+        file_drop_commit(
+            target,
+            destination.clone(),
+            sources,
+            &drop_state,
+            move |destination, sources, commit| {
+                view.commit_file_drop(destination, sources, commit);
+            },
+        );
         true
     });
     row.add_controller(drop);
@@ -2767,7 +3014,7 @@ fn trash_file_drop_action(target: &gtk::DropTarget) -> gtk::gdk::DragAction {
     }
 }
 
-fn install_sidebar_trash_drop(view: &BrowserView, row: &impl IsA<gtk::Widget>) {
+fn install_sidebar_trash_drop(state: &SidebarState, row: &impl IsA<gtk::Widget>) {
     row.add_css_class("file-drop-zone");
     let drop = gtk::DropTarget::new(
         gtk::gdk::FileList::static_type(),
@@ -2775,21 +3022,58 @@ fn install_sidebar_trash_drop(view: &BrowserView, row: &impl IsA<gtk::Widget>) {
     );
     drop.set_preload(true);
     drop.set_propagation_phase(gtk::PropagationPhase::Capture);
-    drop.connect_enter(|target, _, _| trash_file_drop_action(target));
-    drop.connect_motion(|target, _, _| trash_file_drop_action(target));
-    drop.connect_value_notify(|target| {
-        if let Some(offered) = target.current_drop() {
-            offered.status(target.actions(), trash_file_drop_action(target));
+    let enter_feedback = state.drop_feedback.clone();
+    drop.connect_enter(move |target, _, _| {
+        if let Some(row) = target.widget() {
+            enter_feedback.enter(&row);
+        }
+        sidebar_trash_feedback(target, &enter_feedback)
+    });
+    let motion_feedback = state.drop_feedback.clone();
+    drop.connect_motion(move |target, _, _| sidebar_trash_feedback(target, &motion_feedback));
+    let value_feedback = state.drop_feedback.clone();
+    drop.connect_value_notify(move |target| {
+        if let Some(offered) = target.current_drop()
+            && target
+                .widget()
+                .is_some_and(|row| value_feedback.is_current(&row))
+        {
+            offered.status(
+                target.actions(),
+                sidebar_trash_feedback(target, &value_feedback),
+            );
         }
     });
-    let view = view.downgrade();
-    drop.connect_drop(move |_, value, _, _| {
+    let leave_feedback = state.drop_feedback.clone();
+    drop.connect_leave(move |target| {
+        if let Some(row) = target.widget() {
+            leave_feedback.leave(&row);
+        }
+    });
+    let view = state.view.downgrade();
+    let drop_feedback = state.drop_feedback.clone();
+    drop.connect_drop(move |target, value, _, _| {
+        if let Some(row) = target.widget() {
+            drop_feedback.leave(&row);
+        }
         view.upgrade().is_some_and(|view| {
             locations_from_file_list_value(value)
                 .is_some_and(|sources| view.trash_file_drop(sources))
         })
     });
     row.add_controller(drop);
+}
+
+fn sidebar_trash_feedback(
+    target: &gtk::DropTarget,
+    feedback: &sidebar_drop_feedback::SidebarDropFeedback,
+) -> gtk::gdk::DragAction {
+    let Some(row) = target.widget().filter(|row| feedback.is_current(row)) else {
+        return gtk::gdk::DragAction::empty();
+    };
+    let action = trash_file_drop_action(target);
+    feedback.folder(&row, !action.is_empty());
+    action
 }
 
 fn select_sidebar_row(sidebar: &gtk::Box, selected: &gtk::Button) {
@@ -2893,6 +3177,55 @@ fn remove_pinned_place(places: &mut Vec<(Location, String)>, location: &Location
     let original_len = places.len();
     places.retain(|(pinned, _)| pinned != location);
     places.len() != original_len
+}
+
+/// The `(after, before)` pins around an insertion gap when the sidebar was built.
+type PinGap<'a> = (Option<&'a Location>, Option<&'a Location>);
+
+/// Resolves a gap against the latest bookmarks; `None` when both of a gap's
+/// neighbours were unpinned elsewhere, so a drop cannot land somewhere unrelated.
+fn pin_gap_index(places: &[(Location, String)], (after, before): PinGap<'_>) -> Option<usize> {
+    let position = |anchor: &Location| places.iter().position(|(location, _)| location == anchor);
+    match (before.and_then(position), after.and_then(position)) {
+        (Some(index), _) => Some(index),
+        (None, Some(index)) => Some(index + 1),
+        (None, None) if before.is_none() => Some(places.len()),
+        (None, None) => None,
+    }
+}
+
+/// `index` is an insertion point in the list before `source` is removed.
+fn move_pinned_place(places: &mut Vec<(Location, String)>, source: usize, index: usize) -> bool {
+    if source >= places.len() || index > places.len() || index == source || index == source + 1 {
+        return false;
+    }
+    let place = places.remove(source);
+    places.insert(index - usize::from(index > source), place);
+    true
+}
+
+fn pin_locations_at(
+    places: &mut Vec<(Location, String)>,
+    sources: &[(Location, String)],
+    target_index: usize,
+) -> bool {
+    let mut seen = places
+        .iter()
+        .map(|(location, _)| location.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let additions = sources
+        .iter()
+        .filter(|(location, _)| {
+            !is_standard_place_location(location) && seen.insert(location.clone())
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if additions.is_empty() {
+        return false;
+    }
+    let index = target_index.min(places.len());
+    places.splice(index..index, additions);
+    true
 }
 
 fn is_smb_location(location: &Location) -> bool {
@@ -3194,7 +3527,7 @@ pub(crate) fn crypto_password_uuid_for_volume(volume: &gio::Volume) -> Option<St
     let unix = gio_volume_unix_device(volume);
     let hint = unix
         .as_deref()
-        .map(devices::probe_block_crypto)
+        .map(devices::block_crypto_hint)
         .unwrap_or_default();
     devices::crypto_password_uuid(
         volume.uuid().as_deref(),
@@ -3213,7 +3546,7 @@ fn crypto_password_uuid_for_mount(mount: &gio::Mount) -> Option<String> {
         .and_then(|drive| drive.identifier(gio::VOLUME_IDENTIFIER_KIND_UNIX_DEVICE.as_str()));
     let hint = unix
         .as_deref()
-        .map(devices::probe_block_crypto)
+        .map(devices::block_crypto_hint)
         .unwrap_or_default();
     devices::crypto_password_uuid(None, unix.as_deref(), hint.as_ref(), false)
 }
@@ -3560,7 +3893,7 @@ fn gio_icons_are_encrypted(
     names.extend(gio_icon_names(icon));
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
     let hint = unix_device
-        .map(devices::probe_block_crypto)
+        .map(devices::block_crypto_hint)
         .unwrap_or_default();
     devices::is_encrypted_device(&names, start_stop, hint.as_ref())
 }
@@ -3785,6 +4118,14 @@ async fn trash_has_items(root: &gio::File) -> Result<bool, glib::Error> {
         .next_files_future(1, glib::Priority::DEFAULT)
         .await?
         .is_empty())
+}
+
+/// Extra context-menu action placed above the standard place items.
+struct PlaceMenuExtra {
+    icon: &'static str,
+    /// English message key, localized when the menu item is built.
+    label: &'static str,
+    action: fn(&Rc<SidebarState>),
 }
 
 fn sidebar_context_option(icon: &str, label: &str, danger: bool) -> gtk::Button {
@@ -4070,79 +4411,6 @@ fn navigate_to_gio_file(browser: &Rc<Browser>, file: &gio::File) {
     }
 }
 
-fn pinned_places_path() -> PathBuf {
-    crate::adapters::bookmarks::pinned_places_path()
-}
-
-fn load_pinned_places() -> std::io::Result<Vec<(Location, String)>> {
-    match std::fs::read(pinned_places_path()) {
-        Ok(contents) => Ok(parse_pinned_places(&contents)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Vec::new()),
-        Err(error) => Err(error),
-    }
-}
-
-/// GTK bookmarks may contain non-UTF-8 labels.
-fn parse_pinned_places(contents: &[u8]) -> Vec<(Location, String)> {
-    let mut places = Vec::new();
-    for line in contents.split(|byte| *byte == b'\n') {
-        let line = line.strip_suffix(b"\r").unwrap_or(line);
-        let (uri, label) = match line.iter().position(|byte| *byte == b' ') {
-            Some(space) => (&line[..space], Some(&line[space + 1..])),
-            None => (line, None),
-        };
-        if uri.is_empty() {
-            continue;
-        }
-        let Ok(uri) = std::str::from_utf8(uri) else {
-            continue;
-        };
-        let file = gio::File::for_uri(uri);
-        let Some(location) = location_for_file(&file) else {
-            continue;
-        };
-        if places
-            .iter()
-            .any(|(existing, _): &(Location, String)| existing == &location)
-        {
-            continue;
-        }
-        let name = label
-            .filter(|label| !label.is_empty())
-            .map(|label| String::from_utf8_lossy(label).into_owned())
-            .unwrap_or_else(|| location.display_name());
-        places.push((location, name));
-    }
-    places
-}
-
-fn save_pinned_places(places: &[(Location, String)]) -> std::io::Result<()> {
-    let path = pinned_places_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    let contents = serialize_pinned_places(places);
-    crate::storage::atomic_write_config(&path, contents.as_bytes())
-}
-
-fn serialize_pinned_places(places: &[(Location, String)]) -> String {
-    let mut contents = String::new();
-    for (location, name) in places {
-        let uri = location
-            .native_path()
-            .map(gio::File::for_path)
-            .map(|file| file.uri().to_string())
-            .or_else(|| location.uri_value().map(str::to_owned));
-        let Some(uri) = uri.and_then(|uri| sanitize_uri_credentials(&uri).ok().map(|(uri, _)| uri))
-        else {
-            continue;
-        };
-        let label = name.replace(['\n', '\r'], " ");
-        contents.push_str(&format!("{uri} {label}\n"));
-    }
-    contents
-}
-
 pub(crate) fn home_directory() -> PathBuf {
     env::var_os("HOME")
         .map(PathBuf::from)
@@ -4153,17 +4421,53 @@ pub(crate) fn default_save_folder() -> PathBuf {
     glib::user_special_dir(glib::UserDirectory::Downloads).unwrap_or_else(home_directory)
 }
 
-fn startup_location(manager: &PreferenceManager) -> Location {
-    let saved = manager.default_directory();
-    if let Some(path) = &saved
-        && path.is_dir()
-    {
-        return Location::local(path);
-    }
-    if saved.is_some() {
-        manager.set_default_directory(None);
-    }
-    Location::local(home_directory())
+fn open_checked(browser: &Rc<Browser>, location: Location, absent: impl FnOnce() + 'static) {
+    let Some(path) = location.native_path().map(PathBuf::from) else {
+        browser.navigate_location(location, true);
+        return;
+    };
+    let generation = browser.bump_navigation_generation();
+    let weak = Rc::downgrade(browser);
+    glib::MainContext::default().spawn_local(async move {
+        let gone = glib::future_with_timeout(mount_lanes::STALLED_AFTER, async {
+            match probes::folder(&path).await {
+                Err(LocationValidationError::NotDirectory) => true,
+                Err(LocationValidationError::Missing) => probes::folder_was_deleted(&path).await,
+                _ => false,
+            }
+        })
+        .await
+        .unwrap_or(false);
+        let Some(browser) = weak.upgrade() else {
+            return;
+        };
+        if browser.navigation_generation() != generation {
+            return;
+        }
+        if gone {
+            absent();
+        } else {
+            browser.navigate_location(location, true);
+        }
+    });
+}
+
+fn open_default_folder(browser: &Rc<Browser>, manager: &Rc<PreferenceManager>) {
+    let home = Location::local(home_directory());
+    let Some(saved) = manager.default_directory() else {
+        browser.navigate_location(home, true);
+        return;
+    };
+    let weak = Rc::downgrade(browser);
+    let manager = manager.clone();
+    open_checked(browser, Location::local(&saved), move || {
+        if manager.default_directory().as_ref() == Some(&saved) {
+            manager.set_default_directory(None);
+        }
+        if let Some(browser) = weak.upgrade() {
+            browser.navigate_location(home, true);
+        }
+    });
 }
 
 #[cfg(test)]

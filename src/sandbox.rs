@@ -25,7 +25,9 @@ pub(crate) mod archive;
 pub(crate) mod browser;
 pub(crate) mod media;
 pub(crate) mod metadata;
+mod model;
 pub(crate) mod raw_metadata;
+pub(crate) mod runtime;
 
 const WALL_TIME_LIMIT: Duration = Duration::from_secs(12);
 const ADDRESS_SPACE_LIMIT_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -141,6 +143,7 @@ pub(crate) enum ParseOperation {
     ThumbnailCover(CoverFormat),
     PreviewCover(CoverFormat),
     PreviewImage,
+    PreviewRaw,
     InspectImage,
     ConvertImage,
     DocumentImage,
@@ -180,6 +183,7 @@ impl ParseOperation {
             Self::ThumbnailCover(_) => "thumbnail-cover",
             Self::PreviewCover(_) => "preview-cover",
             Self::PreviewImage => "preview-image",
+            Self::PreviewRaw => "preview-raw",
             Self::InspectImage => "inspect-image",
             Self::ConvertImage => "convert-image",
             Self::DocumentImage => "document-image",
@@ -262,6 +266,7 @@ impl ParseOperation {
                 crate::services::image_conversion::MAX_PIXELS,
             )),
             Self::PreviewImage
+            | Self::PreviewRaw
             | Self::DocumentImage
             | Self::DocumentMermaid
             | Self::DocumentMath { .. } => Some((800, 800, 800 * 800)),
@@ -290,6 +295,7 @@ impl ParseOperation {
             | Self::ThumbnailRaw
             | Self::ThumbnailPdf
             | Self::PreviewImage
+            | Self::PreviewRaw
             | Self::RawMetadata
             | Self::PreviewPdf(_) => Some(MAX_RASTER_INPUT_BYTES),
             Self::PreviewModel(_) | Self::ThumbnailModel(_) => Some(MAX_MODEL_INPUT_BYTES),
@@ -346,6 +352,7 @@ pub(crate) struct ParseOutput {
     pub(crate) page: i32,
     pub(crate) pages: i32,
     pub(crate) text_layer: Option<crate::services::PdfTextLayer>,
+    pub(crate) model_mesh: Option<crate::services::ModelMesh>,
 }
 
 pub(crate) fn parse(
@@ -396,6 +403,7 @@ fn is_archive_contract_message(message: &str) -> bool {
     message == crate::adapters::INVALID_ARCHIVE
         || message == crate::adapters::ARCHIVE_TOO_LARGE_MESSAGE
         || message == "Preview cancelled"
+        || message == crate::services::file_activity::HELD_FOR_OPERATION
 }
 
 fn parse_sandboxed(
@@ -412,11 +420,31 @@ fn parse_sandboxed(
     if operation.is_media() {
         return Err("Media previews require a decoded-frame session".into());
     }
-    let input = input
+    let canonical = input
         .canonicalize()
         .map_err(|error| crate::services::io_error_message(&error))?;
+    let stop = cancellation.clone();
+    let hold = crate::services::file_activity::hold([input, &canonical], move || stop.cancel())?;
+    hold.settle(parse_canonical(
+        &canonical,
+        operation,
+        value,
+        media_backend,
+        cancellation,
+        progress,
+    ))
+}
+
+fn parse_canonical(
+    input: &Path,
+    operation: ParseOperation,
+    value: i32,
+    media_backend: MediaPreviewBackend,
+    cancellation: &Cancellation,
+    progress: &dyn Fn(crate::services::ModelPreviewStage),
+) -> Result<ParseOutput, String> {
     let input_metadata =
-        fs::metadata(&input).map_err(|error| crate::services::io_error_message(&error))?;
+        fs::metadata(input).map_err(|error| crate::services::io_error_message(&error))?;
     if !input_metadata.is_file() {
         return Err("Preview input is not a regular file".to_owned());
     }
@@ -441,12 +469,13 @@ fn parse_sandboxed(
             },
         );
     }
-    if let Some(result) = browser::preview(&input, &operation, cancellation) {
+    if let Some(result) = browser::preview(input, &operation, cancellation) {
         return result.map(|data| ParseOutput {
             data,
             page: 0,
             pages: 0,
             text_layer: None,
+            model_mesh: None,
         });
     }
 
@@ -472,7 +501,7 @@ fn parse_sandboxed(
     let mut command = sandbox_command(
         &bwrap,
         &executable,
-        &input,
+        input,
         output.path(),
         operation.clone(),
         value,
@@ -552,6 +581,11 @@ fn parse_sandboxed(
         });
     }
     let (page, pages) = read_metadata(&output.path().join("result.meta"));
+    let model_mesh = if let ParseOperation::PreviewModel(render) = operation {
+        model::read_mesh(render, &output.path().join("result.model"))?
+    } else {
+        None
+    };
     // A page without an extractable text layer (scanned images, malformed layout)
     // still previews; selection just stays unavailable there.
     let text_layer = if matches!(operation, ParseOperation::PreviewPdf(_)) {
@@ -566,6 +600,7 @@ fn parse_sandboxed(
         page,
         pages,
         text_layer,
+        model_mesh,
     })
 }
 
@@ -617,10 +652,119 @@ pub(crate) fn sandbox_start_failed(error: &io::Error) -> String {
     .into_owned()
 }
 
-fn spawn_renderer(command: &mut Command) -> io::Result<Child> {
+const NAMESPACE_WAIT: Duration = Duration::from_secs(1);
+
+pub(crate) struct Renderer {
+    child: Child,
+    init: Option<rustix::fd::OwnedFd>,
+    /// Held open so bubblewrap's closing write to the info pipe cannot raise SIGPIPE.
+    _info: Option<rustix::fd::OwnedFd>,
+}
+
+impl Renderer {
+    fn id(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn stdout(&mut self) -> Option<std::process::ChildStdout> {
+        self.child.stdout.take()
+    }
+
+    fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if status.is_some() {
+            self.await_namespace();
+        }
+        Ok(status)
+    }
+
+    fn await_namespace(&mut self) {
+        use rustix::event::{PollFd, PollFlags, Timespec, poll};
+        let Some(init) = self.init.take() else {
+            return;
+        };
+        let deadline = Instant::now() + NAMESPACE_WAIT;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let timeout = Timespec {
+                tv_sec: remaining.as_secs() as i64,
+                tv_nsec: i64::from(remaining.subsec_nanos()),
+            };
+            let mut fds = [PollFd::new(&init, PollFlags::IN)];
+            match poll(&mut fds, Some(&timeout)) {
+                Err(rustix::io::Errno::INTR) if !remaining.is_zero() => {}
+                _ => return,
+            }
+        }
+    }
+}
+
+fn spawn_renderer(command: &mut Command) -> io::Result<Renderer> {
     use std::os::unix::process::CommandExt;
 
-    command.process_group(0).spawn()
+    let (info, info_end) = rustix::pipe::pipe_with(rustix::pipe::PipeFlags::CLOEXEC)?;
+    command.stderr(Stdio::from(info_end));
+    let spawned = command.process_group(0).spawn();
+    // Drops the parent's write end, or the pipe never reports bubblewrap's exit.
+    command.stderr(Stdio::null());
+    let child = spawned?;
+    let init = namespace_init(&info, &child).and_then(|pid| {
+        rustix::process::pidfd_open(pid, rustix::process::PidfdFlags::empty()).ok()
+    });
+    Ok(Renderer {
+        child,
+        init,
+        _info: Some(info),
+    })
+}
+
+fn namespace_init(info: &rustix::fd::OwnedFd, child: &Child) -> Option<Pid> {
+    use rustix::event::{PollFd, PollFlags, Timespec, poll};
+    let deadline = Instant::now() + NAMESPACE_WAIT;
+    let bwrap = child_pidfd(child);
+    let mut report = Vec::new();
+    loop {
+        if let Some(pid) = reported_init(&report) {
+            return Some(pid);
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() || report.len() > 4096 {
+            return None;
+        }
+        let timeout = Timespec {
+            tv_sec: remaining.as_secs() as i64,
+            tv_nsec: i64::from(remaining.subsec_nanos()),
+        };
+        let mut fds = vec![PollFd::new(info, PollFlags::IN)];
+        if let Some(bwrap) = &bwrap {
+            fds.push(PollFd::new(bwrap, PollFlags::IN));
+        }
+        match poll(&mut fds, Some(&timeout)) {
+            Ok(_) if fds[0].revents().contains(PollFlags::IN) => {
+                let mut chunk = [0; 512];
+                match rustix::io::read(info, &mut chunk) {
+                    Ok(0) => return reported_init(&report),
+                    Ok(read) => report.extend_from_slice(&chunk[..read]),
+                    Err(rustix::io::Errno::INTR | rustix::io::Errno::AGAIN) => {}
+                    Err(_) => return None,
+                }
+            }
+            Ok(_) if fds[0].revents().contains(PollFlags::HUP) => return reported_init(&report),
+            Ok(_) if fds.get(1).is_some_and(|fd| !fd.revents().is_empty()) => {
+                return reported_init(&report);
+            }
+            Ok(_) | Err(rustix::io::Errno::INTR) => {}
+            Err(_) => return None,
+        }
+    }
+}
+
+fn reported_init(report: &[u8]) -> Option<Pid> {
+    let report = std::str::from_utf8(report).ok()?;
+    let (_, after) = report.split_once("\"child-pid\":")?;
+    let digits = after.trim_start();
+    let end = digits.find(|character: char| !character.is_ascii_digit())?;
+    Pid::from_raw(digits[..end].parse().ok()?)
 }
 
 /// `None` on kernels without pidfd support; wait loops fall back to interval polling.
@@ -650,7 +794,7 @@ fn wait_step(pidfd: Option<&rustix::fd::OwnedFd>, deadline: Instant) {
 }
 
 fn wait_for_renderer(
-    child: &mut Child,
+    child: &mut Renderer,
     cancellation: &Cancellation,
     wall_time_limit: Duration,
 ) -> Result<ExitStatus, String> {
@@ -658,14 +802,14 @@ fn wait_for_renderer(
 }
 
 fn wait_for_renderer_reporting(
-    child: &mut Child,
+    child: &mut Renderer,
     cancellation: &Cancellation,
     wall_time_limit: Duration,
     progress: &mut dyn FnMut(),
 ) -> Result<ExitStatus, String> {
     let started = Instant::now();
     let deadline = started + wall_time_limit;
-    let pidfd = child_pidfd(child);
+    let pidfd = child_pidfd(&child.child);
     loop {
         if cancellation.is_cancelled() {
             terminate(child);
@@ -687,16 +831,33 @@ fn wait_for_renderer_reporting(
     }
 }
 
+/// Resolves a helper tool the way the sandbox's `PATH` does. The sandbox root
+/// is mounted at its host path, so the host file is the one helpers run.
+pub(crate) fn sandbox_tool(name: &str) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+    runtime::current()
+        .tool_directories()
+        .map(|directory| directory.join(name))
+        .find(|candidate| {
+            fs::metadata(candidate).is_ok_and(|metadata| {
+                metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+            })
+        })
+}
+
 fn runtime_command(bwrap: &Path, needs_media_libraries: bool) -> Command {
+    let runtime = runtime::current();
     let mut command = Command::new(bwrap);
     command.args([
+        "--info-fd",
+        "2",
         "--unshare-all",
         "--die-with-parent",
         "--new-session",
         "--clearenv",
         "--setenv",
         "PATH",
-        option_env!("STRATA_SANDBOX_PATH").unwrap_or("/usr/bin"),
+        runtime.path.as_str(),
         "--setenv",
         "HOME",
         "/nonexistent",
@@ -716,8 +877,8 @@ fn runtime_command(bwrap: &Path, needs_media_libraries: bool) -> Command {
         "--dir",
         "/etc",
         "--ro-bind",
-        option_env!("STRATA_SANDBOX_ROOT").unwrap_or("/usr"),
-        option_env!("STRATA_SANDBOX_ROOT").unwrap_or("/usr"),
+        runtime.root.as_str(),
+        runtime.root.as_str(),
         "--ro-bind-try",
         "/lib",
         "/lib",
@@ -740,7 +901,7 @@ fn runtime_command(bwrap: &Path, needs_media_libraries: bool) -> Command {
         "/etc/ImageMagick-6",
         "/etc/ImageMagick-6",
     ]);
-    if let Some(loaders) = option_env!("STRATA_SANDBOX_GDK_PIXBUF_MODULE_FILE") {
+    if let Some(loaders) = &runtime.gdk_pixbuf_module_file {
         command.args(["--setenv", "GDK_PIXBUF_MODULE_FILE", loaders]);
     }
     if needs_media_libraries {
@@ -815,7 +976,7 @@ fn sandbox_command(
     command.arg("--");
     if !operation.is_media() {
         command
-            .arg(option_env!("STRATA_SANDBOX_PRLIMIT").unwrap_or("/usr/bin/prlimit"))
+            .arg(&runtime::current().prlimit)
             .arg(format!("--as={ADDRESS_SPACE_LIMIT_BYTES}"))
             .arg("--cpu=10")
             .arg(format!(
@@ -852,12 +1013,13 @@ fn sandbox_command(
                 format!("{value}:{}x{}", size.width, size.height)
             }
             ParseOperation::PreviewModel(render) => format!(
-                "{}:{}x{}:{:06x}:{:06x}",
+                "{}:{}x{}:{:06x}:{:06x}:{}",
                 render.format.argument(),
                 render.size.width,
                 render.size.height,
                 render.palette.accent,
                 render.palette.surface,
+                render.view.argument(),
             ),
             ParseOperation::ThumbnailModel(format) => format.argument().to_owned(),
             ParseOperation::ThumbnailCover(format) => format.argument().to_owned(),
@@ -1003,16 +1165,17 @@ pub(crate) fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     (width > 0 && height > 0).then_some((width, height))
 }
 
-fn terminate(child: &mut Child) {
-    if let Ok(raw_pid) = i32::try_from(child.id())
+fn terminate(renderer: &mut Renderer) {
+    if let Ok(raw_pid) = i32::try_from(renderer.id())
         && let Some(process_group) = Pid::from_raw(raw_pid)
     {
         let _killed = kill_process_group(process_group, Signal::KILL);
     }
     // bwrap is also the PID-namespace init process, so descendants that create a new
     // process group still die with it.
-    let _killed = child.kill();
-    let _waited = child.wait();
+    let _killed = renderer.child.kill();
+    let _waited = renderer.child.wait();
+    renderer.await_namespace();
 }
 
 fn read_private_output(path: &Path, max_bytes: u64) -> Result<Vec<u8>, OutputError> {

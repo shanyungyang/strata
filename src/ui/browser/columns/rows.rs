@@ -384,11 +384,18 @@ pub(super) fn column_rows(
                 let Some(sources) = locations_from_file_list_value(value) else {
                     return false;
                 };
-                let commit = file_drop_commit(target, &destination, &sources, &drop_state);
                 slide_in_down(&dropped_row);
-                glib::timeout_add_local_once(Duration::from_millis(300), move || {
-                    state.commit_file_drop(destination, sources, commit);
-                });
+                file_drop_commit(
+                    target,
+                    destination,
+                    sources,
+                    &drop_state,
+                    move |destination, sources, commit| {
+                        glib::timeout_add_local_once(Duration::from_millis(300), move || {
+                            state.commit_file_drop(destination, sources, commit);
+                        });
+                    },
+                );
                 true
             });
             row.add_controller(drop);
@@ -832,11 +839,13 @@ pub(super) fn column_rows(
         weak_row.set(Some(&row));
         let weak_rename_label = glib::WeakRef::new();
         weak_rename_label.set(Some(&label));
+        let edit = crate::ui::collection_edit::EditWidgets::new(&rename, &label);
+        crate::ui::collection_edit::register_item_edit(item, &edit);
         rows_for_setup.borrow_mut().push(BoundRow {
             item: weak_item,
             row: weak_row,
             rename_label: weak_rename_label,
-            edit: crate::ui::collection_edit::EditWidgets::new(&rename, &label),
+            edit,
             spacer,
             size,
         });
@@ -846,7 +855,6 @@ pub(super) fn column_rows(
     let search_active_for_bind = recursive_search_active.clone();
     let search_results_for_bind = search_results.clone();
     let hits_for_bind = hits.clone();
-    let rows_for_bind = bound_rows.clone();
     let scrolling_for_bind = scrolling.clone();
     factory.connect_bind(move |_, item| {
         let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
@@ -924,11 +932,7 @@ pub(super) fn column_rows(
         } else {
             source_position.and_then(|position| browser?.entry_at(depth, position))
         };
-        let edit = rows_for_bind
-            .borrow()
-            .iter()
-            .find(|bound| bound.item.upgrade().as_ref() == Some(item))
-            .map(|bound| bound.edit.clone());
+        let edit = crate::ui::collection_edit::item_edit(item);
         if let Some(edit) = &edit {
             if let Some(entry) = &entry {
                 edit.bind(&entry.location);
@@ -1053,27 +1057,15 @@ pub(super) fn column_rows(
         size.set_visible(show_sizes && !editing && !size_text.is_empty());
         crate::ui::accessibility::describe_entry(item, &label.label(), entry.as_ref());
     });
-    let rows_for_unbind = bound_rows.clone();
     factory.connect_unbind(move |_, object| {
-        let edit = rows_for_unbind
-            .borrow()
-            .iter()
-            .find(|bound| {
-                bound
-                    .item
-                    .upgrade()
-                    .as_ref()
-                    .map(|item| item.upcast_ref::<glib::Object>())
-                    == Some(object)
-            })
-            .map(|bound| bound.edit.clone());
-        if let Some(edit) = edit {
+        if let Some(edit) = crate::ui::collection_edit::item_edit(object) {
             edit.unbind();
         }
         crate::ui::thumbnail::cancel_list_item_thumbnails(object);
     });
     let rows_for_teardown = bound_rows.clone();
     factory.connect_teardown(move |_, object| {
+        crate::ui::collection_edit::forget_item_edit(object);
         rows_for_teardown.borrow_mut().retain(|bound| {
             bound
                 .item

@@ -344,25 +344,42 @@ fn file_drop_action_hover_matches_cross_volume_strategy() {
 }
 
 #[test]
-fn file_drop_commit_rejects_the_recent_collection() {
+fn file_drop_commit_waits_for_the_volume_answer_and_rejects_the_recent_collection() {
     crate::test_support::gtk_test(
-        "ui::browser::clipboard::tests::file_drop_commit_rejects_the_recent_collection",
+        "ui::browser::clipboard::tests::file_drop_commit_waits_for_the_volume_answer_and_rejects_the_recent_collection",
         || {
-            let recent = Location::uri("recent:///");
-            let prepared = prepare_file_drop_target({
-                let recent = recent.clone();
-                move || Some(recent.clone())
-            });
-
-            assert_eq!(
+            let root = tempfile::tempdir().expect("fixture");
+            std::fs::create_dir(root.path().join("folder")).expect("folder");
+            std::fs::write(root.path().join("note.txt"), b"x").expect("source");
+            for (destination, source, expected) in [
+                (
+                    Location::uri("recent:///"),
+                    Location::local("/fixture/source.txt"),
+                    crate::services::DropCommit::Forbidden,
+                ),
+                (
+                    Location::local(root.path().join("folder")),
+                    Location::local(root.path().join("note.txt")),
+                    crate::services::DropCommit::Move,
+                ),
+            ] {
+                let prepared = prepare_file_drop_target({
+                    let destination = destination.clone();
+                    move || Some(destination.clone())
+                });
+                let committed = Rc::new(Cell::new(None));
+                let sink = committed.clone();
                 file_drop_commit(
                     &prepared.target,
-                    &recent,
-                    &[Location::local("/fixture/source.txt")],
+                    destination.clone(),
+                    vec![source],
                     &prepared.state,
-                ),
-                crate::services::DropCommit::Forbidden
-            );
+                    move |_, _, commit| sink.set(Some(commit)),
+                );
+                prepared.state.reset();
+                pump_main_loop_until(Duration::from_secs(5), || committed.get().is_some());
+                assert_eq!(committed.get(), Some(expected), "{destination:?}");
+            }
         },
     );
 }
@@ -713,6 +730,25 @@ fn cleared_shared_cut_is_not_revived_by_stale_view_state() {
 }
 
 #[test]
+fn row_marks_match_gio_equivalent_representations() {
+    let native = Location::local("/fixture/first");
+    let uri = Location::uri("file:///fixture/first");
+
+    set_shared_marks(std::slice::from_ref(&native), &[]);
+    assert_eq!(clipboard_mark(&uri), ClipboardMark::Copy);
+
+    set_shared_marks(&[], std::slice::from_ref(&uri));
+    assert_eq!(clipboard_mark(&native), ClipboardMark::Cut);
+    assert_eq!(
+        clipboard_mark(&Location::local("/fixture/other")),
+        ClipboardMark::None
+    );
+
+    clear_shared_marks();
+    assert_eq!(clipboard_mark(&native), ClipboardMark::None);
+}
+
+#[test]
 fn completed_moves_match_gio_equivalent_cut_entries() {
     let mut cut = vec![Location::local("/fixture/first")];
 
@@ -774,6 +810,59 @@ fn shell_escape_path_preserves_newlines_and_single_quotes() {
         shell_escape_path(Path::new("/tmp/line\nbob's notes")),
         "'/tmp/line\nbob'\\''s notes'"
     );
+}
+
+#[test]
+fn shell_escape_path_quotes_only_non_utf8_components() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    for (path, expected) in [
+        (
+            &b"/mnt/Mass 1/bad\xff.txt"[..],
+            "/mnt/Mass\\ 1/$'bad\\xff.txt'",
+        ),
+        (b"/path/to/caf\xc3\xa9\xff.txt", "/path/to/$'café\\xff.txt'"),
+        (b"bad\xff it's\\.txt", "$'bad\\xff it\\'s\\\\.txt'"),
+        (
+            b"/tmp/line\nbreak/bad\xff\xc2\x85",
+            "/tmp/$'line\\x0abreak'/$'bad\\xff\\xc2\\x85'",
+        ),
+    ] {
+        assert_eq!(
+            shell_escape_path(Path::new(OsStr::from_bytes(path))),
+            expected
+        );
+    }
+    assert_eq!(
+        copy_path_text(
+            &Location::local(Path::new(OsStr::from_bytes(b"/path/to/bad\xff"))),
+            true
+        ),
+        "/path/to/$'bad\\xff'/"
+    );
+}
+
+#[test]
+fn copied_non_utf8_paths_resolve_in_bash() {
+    use std::ffi::OsStr;
+    use std::os::unix::ffi::OsStrExt;
+
+    let dir = tempfile::tempdir().expect("temporary directory");
+    let directory = dir.path().join(OsStr::from_bytes(b"line\nbreak \xfe"));
+    std::fs::create_dir(&directory).expect("create directory");
+    let file = directory.join(OsStr::from_bytes(b"bad\xff it's\x85.txt"));
+    std::fs::write(&file, b"content").expect("write file");
+
+    for (path, is_directory) in [(&directory, true), (&file, false)] {
+        let copied = copy_path_text(&Location::local(path), is_directory);
+        let status = std::process::Command::new("bash")
+            .arg("-c")
+            .arg(format!("test -e {copied}"))
+            .status()
+            .expect("run bash");
+        assert!(status.success(), "bash could not resolve {copied:?}");
+    }
 }
 
 fn pump_main_loop_until(timeout: Duration, condition: impl Fn() -> bool) {
@@ -983,6 +1072,60 @@ fn recycling_the_hovered_row_does_not_open_its_previous_folder() {
             *hovered.borrow_mut() = Some(Location::local("/fixture/second"));
             pump_main_loop_until(Duration::from_millis(100), || navigated.get());
             assert!(!navigated.get());
+        },
+    );
+}
+
+#[test]
+fn directory_drag_snapshot_uses_entry_metadata_without_touching_paths() {
+    crate::test_support::gtk_test(
+        "ui::browser::clipboard::tests::directory_drag_snapshot_uses_entry_metadata_without_touching_paths",
+        || {
+            use crate::model::EntryKind;
+            let fixture = tempfile::tempdir().expect("fixture");
+            for (kinds, expected) in [
+                (
+                    vec![EntryKind::Directory, EntryKind::DirectorySymbolicLink],
+                    true,
+                ),
+                (vec![EntryKind::File], false),
+                (vec![EntryKind::Directory, EntryKind::File], false),
+            ] {
+                let entries = kinds
+                    .into_iter()
+                    .enumerate()
+                    .map(|(index, kind)| {
+                        let mut entry = crate::test_support::operations::entry(Location::local(
+                            fixture.path().join(index.to_string()),
+                        ));
+                        entry.kind = kind;
+                        entry.display_name = format!("Display {index}");
+                        entry
+                    })
+                    .collect::<Vec<_>>();
+                let content = file_drag_content(&entries).expect("drag content");
+                let snapshot = drag_snapshot_for_content(&content).expect("trusted snapshot");
+                assert_eq!(
+                    &*snapshot.locations,
+                    entries
+                        .iter()
+                        .map(|entry| entry.location.clone())
+                        .collect::<Vec<_>>()
+                );
+                assert_eq!(
+                    snapshot.folders.as_deref(),
+                    expected
+                        .then(|| {
+                            entries
+                                .iter()
+                                .map(|entry| (entry.location.clone(), entry.display_name.clone()))
+                                .collect::<Vec<_>>()
+                        })
+                        .as_deref()
+                );
+                let foreign = gtk::gdk::ContentProvider::for_value(&"foreign".to_value());
+                assert!(drag_snapshot_for_content(&foreign).is_none());
+            }
         },
     );
 }

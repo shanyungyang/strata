@@ -238,13 +238,17 @@ fn relative_input_resolves_only_against_a_given_native_folder() {
         ),
     ] {
         browser.navigate(Location::local("/fixture"));
-        assert_eq!(browser.navigate_input_from(input, base), Ok(()), "{input}");
+        assert_eq!(
+            browser.navigate_input_located(input, base).map(|_| ()),
+            Ok(()),
+            "{input}"
+        );
         assert_eq!(browser.active_location(), Some(expected), "{input}");
     }
 
     browser.navigate(Location::local("/fixture"));
     assert!(matches!(
-        browser.navigate_input_from("user@host:path", base),
+        browser.navigate_input_located("user@host:path", base),
         Err(LocationValidationError::UnsupportedShorthand(_))
     ));
     assert_eq!(browser.active_location(), Some(Location::local("/fixture")));
@@ -386,13 +390,15 @@ fn rejected_location_input_preserves_navigation_state() {
     browser.navigate(Location::local("/fixture"));
     events.borrow_mut().clear();
 
-    assert_eq!(
-        browser.navigate_input("/restricted"),
-        Err(LocationValidationError::Inaccessible)
-    );
+    assert_eq!(browser.navigate_input("/restricted"), Ok(()));
 
     assert_eq!(browser.active_location(), Some(Location::local("/fixture")));
-    assert!(events.borrow().is_empty());
+    assert!(matches!(
+        events.borrow().as_slice(),
+        [BrowserEvent::LocationNavigationRejected {
+            error: LocationValidationError::Inaccessible
+        }]
+    ));
 }
 
 #[test]

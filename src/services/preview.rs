@@ -65,6 +65,7 @@ pub struct PreviewRequest {
     pub pdf_page: i32,
     pub media_size: MediaPreviewSize,
     pub model_palette: super::ModelPalette,
+    pub model_view: super::ModelView,
     pub archive_password: Option<SecretString>,
 }
 
@@ -127,6 +128,7 @@ pub enum PreviewContent {
     },
     Model {
         png: Vec<u8>,
+        mesh: Option<super::ModelMesh>,
     },
     SandboxedMedia {
         media: SandboxedMedia,
@@ -208,8 +210,16 @@ pub trait PreviewProvider {
 /// Leading bytes read to decide a local file's preview family.
 pub(crate) const CONTENT_SAMPLE_BYTES: usize = 8 * 1024;
 
-fn content_type_for_path(path: &Path) -> glib::GString {
-    gio::content_type_guess(Some(path), None::<&[u8]>).0
+pub(crate) fn guess_content_type(path: &Path) -> (String, bool) {
+    let (guessed, uncertain) = gio::content_type_guess(Some(path), None::<&[u8]>);
+    if !guessed.starts_with("image/") && crate::sandbox::raw_metadata::is_raw(path) {
+        return ("image/x-dcraw".to_owned(), false);
+    }
+    (guessed.to_string(), uncertain)
+}
+
+fn content_type_for_path(path: &Path) -> String {
+    guess_content_type(path).0
 }
 
 pub(crate) fn is_image_path(path: &Path) -> bool {
@@ -221,20 +231,19 @@ pub(crate) fn is_media_path(path: &Path) -> bool {
     content_type.starts_with("audio/") || content_type.starts_with("video/")
 }
 
-pub(crate) fn read_head_sample(path: &Path) -> Option<Vec<u8>> {
+pub(crate) fn read_head_sample(path: &Path) -> std::io::Result<Vec<u8>> {
     use std::io::Read;
-    let file = std::fs::File::open(path).ok()?;
+    let file = super::file_activity::open(path)?;
     let mut sample = Vec::with_capacity(CONTENT_SAMPLE_BYTES);
     file.take(CONTENT_SAMPLE_BYTES as u64)
-        .read_to_end(&mut sample)
-        .ok()?;
-    Some(sample)
+        .read_to_end(&mut sample)?;
+    Ok(sample)
 }
 
 /// Whether a local file's leading bytes still back the visual family its name claims,
 /// so metadata probes skip source files that merely share a media extension.
 pub(crate) fn bytes_support_named_family(path: &Path) -> bool {
-    let Some(sample) = read_head_sample(path) else {
+    let Ok(sample) = read_head_sample(path) else {
         return true;
     };
     let mut content_type = content_type_for_path(path).to_string();

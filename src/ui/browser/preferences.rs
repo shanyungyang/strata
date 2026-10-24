@@ -67,8 +67,13 @@ impl BrowserView {
         );
         self.bind_view_preference(
             manager,
-            PreferenceManager::auto_refresh_interval,
-            Self::set_auto_refresh_interval,
+            PreferenceManager::list_visible_columns,
+            |view, _| view.set_list_columns(),
+        );
+        self.bind_view_preference(
+            manager,
+            PreferenceManager::watch_network_folders,
+            Self::set_watch_network_folders,
         );
         self.bind_view_preference(
             manager,

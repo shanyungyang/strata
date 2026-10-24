@@ -75,6 +75,8 @@ exec "$engine" run "${options[@]}" \
   --env "STRATA_E2E_UPDATE_BASELINES=${STRATA_E2E_UPDATE_BASELINES:-0}" \
   --env "STRATA_E2E_WORKERS=${STRATA_E2E_WORKERS:-auto}" \
   --env "STRATA_E2E_BUNDLE=${bundle:+/workspace/$bundle}" \
+  --env "STRATA_E2E_MAIN_IO=${STRATA_E2E_MAIN_IO:-}" \
+  --env "STRATA_UI_STALL_MS=${STRATA_UI_STALL_MS:-}" \
   "$image" bash -euc '
     mkdir -p "$HOME" "$CARGO_HOME"
     if [[ -n "${STRATA_E2E_BUNDLE:-}" ]]; then
@@ -82,7 +84,7 @@ exec "$engine" run "${options[@]}" \
       test -x "$STRATA_BINARY"
     else
       rustc --version
-      cargo build --locked --bin strata
+      cargo build --locked --bin strata --features invariant-checks
       export STRATA_BINARY="$CARGO_TARGET_DIR/debug/strata"
     fi
     exec ./scripts/e2e-native.sh "$@"

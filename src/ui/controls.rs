@@ -37,6 +37,27 @@ pub(super) fn stepper(labels: [String; 3]) -> (gtk::Box, [gtk::Button; 3]) {
     (control, buttons)
 }
 
+/// A numeric stepper with GTK's native spin actions, decrement before the entry.
+pub(super) fn number_stepper(min: u32, max: u32, step: u32) -> gtk::SpinButton {
+    let control = gtk::SpinButton::with_range(f64::from(min), f64::from(max), f64::from(step));
+    control.set_numeric(true);
+    control.set_width_chars(3);
+    control.set_alignment(0.5);
+    let mut child = control.first_child();
+    while let Some(widget) = child {
+        child = widget.next_sibling();
+        if widget.has_css_class("down") {
+            widget.insert_before(&control, control.first_child().as_ref());
+            break;
+        }
+    }
+    control.set_update_policy(gtk::SpinButtonUpdatePolicy::IfValid);
+    crate::assets::use_bundled_spin_icons(&control);
+    control.add_css_class("form-control");
+    control.add_css_class("text-size-control");
+    control
+}
+
 pub(super) fn pane_header_action(widget: &impl IsA<gtk::Widget>) {
     widget.add_css_class("column-header-action");
     widget.set_valign(gtk::Align::Center);
@@ -267,7 +288,7 @@ pub(super) fn check_menu_option(label: &str, selected: bool) -> (gtk::Button, gt
 
 const MENU_OPTION_CLASS: &str = "column-menu-option";
 
-fn menu_action(label: &str) -> gtk::Button {
+pub(super) fn menu_action(label: &str) -> gtk::Button {
     let action = super::accessibility::menu_item_button();
     action.set_child(Some(&menu_option_label(label)));
     action.add_css_class(MENU_OPTION_CLASS);
@@ -550,17 +571,44 @@ pub(super) fn focus_button(button: &gtk::Button) {
 
 impl ModalLayout {
     pub fn set_loading(&self, loading: bool, description: Option<&str>) {
-        if loading {
-            let description =
-                description.map_or_else(|| crate::i18n::tr("Working…"), str::to_owned);
-            crate::ui::accessibility::set_description(&self.loading, Some(&description));
-            self.loading.set_visible(true);
-            self.loading.start();
-        } else {
-            self.loading.stop();
-            self.loading.set_visible(false);
-            crate::ui::accessibility::set_description(&self.loading, None);
-        }
+        set_modal_loading(&self.loading, loading, description);
+    }
+}
+
+fn modal_loading_spinner() -> gtk::Spinner {
+    let loading = gtk::Spinner::new();
+    loading.add_css_class("action-dialog-loading");
+    loading.set_visible(false);
+    loading
+}
+
+/// Starts a dialog spinner that may have run before. GTK 4.24 leaves a spinner
+/// restarted after being hidden blank or frozen, so this swaps in a fresh one
+/// and returns it.
+pub(super) fn restart_modal_loading(
+    spinner: &gtk::Spinner,
+    description: Option<&str>,
+) -> gtk::Spinner {
+    let fresh = modal_loading_spinner();
+    if let Some(parent) = spinner.parent().and_downcast::<gtk::Box>() {
+        parent.insert_child_after(&fresh, Some(spinner));
+        parent.remove(spinner);
+    }
+    set_modal_loading(&fresh, true, description);
+    fresh
+}
+
+/// [`ModalLayout::set_loading`] for a dialog that keeps only its spinner.
+pub(super) fn set_modal_loading(spinner: &gtk::Spinner, loading: bool, description: Option<&str>) {
+    if loading {
+        let description = description.map_or_else(|| crate::i18n::tr("Working…"), str::to_owned);
+        crate::ui::accessibility::set_description(spinner, Some(&description));
+        spinner.set_visible(true);
+        spinner.start();
+    } else {
+        spinner.stop();
+        spinner.set_visible(false);
+        crate::ui::accessibility::set_description(spinner, None);
     }
 }
 
@@ -660,9 +708,7 @@ pub(super) fn modal_layout_with_tone(
     heading.append(&title);
     heading.append(&subtitle);
 
-    let loading = gtk::Spinner::new();
-    loading.add_css_class("action-dialog-loading");
-    loading.set_visible(false);
+    let loading = modal_loading_spinner();
 
     let close = gtk::Button::new();
     close.add_css_class("action-dialog-close");

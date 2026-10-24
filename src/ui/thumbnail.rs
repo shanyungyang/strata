@@ -18,6 +18,8 @@ use crate::{
 mod background;
 mod camera;
 mod slot;
+#[cfg(test)]
+mod tests;
 mod viewport;
 pub(crate) use slot::ThumbnailSlot;
 pub(super) use viewport::{near_viewport, request_metadata};
@@ -50,6 +52,9 @@ thread_local! {
         RefCell::new(HashMap::new());
     static TRACKED_THUMBNAILS: RefCell<HashMap<usize, TrackedThumbnail>> = RefCell::new(HashMap::new());
     static REFRESHING_CUSTOMIZED_ICONS: Cell<bool> = const { Cell::new(false) };
+    static RELEASED_THUMBNAILS: RefCell<Vec<SettledPark>> = const { RefCell::new(Vec::new()) };
+    static RELEASES: RefCell<Option<crate::services::file_activity::Subscription>> =
+        const { RefCell::new(None) };
 }
 
 struct TrackedThumbnail {
@@ -490,14 +495,57 @@ struct ThumbnailRequest<'a> {
     thumbnail_size: i32,
 }
 
+#[derive(Clone)]
+pub(super) struct ThumbnailSource {
+    path: PathBuf,
+    kind: Option<ThumbnailKind>,
+    modified: Option<i64>,
+    file_size: Option<u64>,
+    fallback_icon: String,
+    icon_size: i32,
+    thumbnail_size: i32,
+}
+
 fn set_thumbnail_for_path(request: ThumbnailRequest<'_>) {
+    viewport::cancel_metadata(request.image.as_ptr() as usize);
+    request
+        .image
+        .set_thumbnail_source(request.kind.map(|_| ThumbnailSource {
+            path: request.path.to_path_buf(),
+            kind: request.kind,
+            modified: request.modified,
+            file_size: request.file_size,
+            fallback_icon: request.fallback_icon.to_owned(),
+            icon_size: request.icon_size,
+            thumbnail_size: request.thumbnail_size,
+        }));
+    display_thumbnail_for_path(request);
+}
+
+fn refresh_slot_thumbnail(image: &ThumbnailSlot) {
+    let Some(source) = image.thumbnail_source() else {
+        return;
+    };
+    display_thumbnail_for_path(ThumbnailRequest {
+        image,
+        path: &source.path,
+        kind: source.kind,
+        modified: source.modified,
+        file_size: source.file_size,
+        fallback_icon: &source.fallback_icon,
+        icon_size: source.icon_size,
+        thumbnail_size: source.thumbnail_size,
+    });
+}
+
+fn display_thumbnail_for_path(request: ThumbnailRequest<'_>) {
     let customization_path = (request.kind != Some(ThumbnailKind::Camera)).then_some(request.path);
     let has_custom_icon = customization_path.is_some_and(|path| {
         super::preferences::PreferenceManager::shared()
             .custom_icon(path)
             .is_some()
     });
-    if has_custom_icon {
+    if has_custom_icon || !super::preferences::PreferenceManager::shared().show_thumbnails() {
         set_fallback_icon(
             request.image,
             customization_path,
@@ -999,6 +1047,7 @@ async fn finish_thumbnail_job(
     result: Result<(crate::sandbox::browser::Thumbnail, bool), String>,
 ) {
     let targets = take_pending_targets(&job.key, job.id);
+    let requested = (job.key, job.kind);
     let key = job.resolved;
     let path = key.path.clone();
     if let Some(targets) = targets {
@@ -1029,6 +1078,10 @@ async fn finish_thumbnail_job(
                     enqueue_persist(key.path.clone(), mtime, png);
                 }
             }
+            Err(message) if message == crate::services::file_activity::HELD_FOR_OPERATION => {
+                crate::metrics::mark_thumbnail_cancelled();
+                admit_after_release(requested, targets);
+            }
             Err(_) => {
                 crate::metrics::mark_thumbnail_cancelled();
                 THUMBNAIL_CACHE.with(|cache| cache.borrow_mut().insert_failure(key));
@@ -1038,6 +1091,31 @@ async fn finish_thumbnail_job(
     }
     let counts = crate::metrics::thumbnail_counts();
     tracing::debug!(?counts, "thumbnail pipeline settled");
+}
+
+fn admit_after_release((key, kind): (ThumbnailKey, ThumbnailKind), targets: Vec<PendingTarget>) {
+    let parks = targets.into_iter().map(|target| SettledPark {
+        key: key.clone(),
+        kind,
+        target,
+    });
+    if !crate::services::file_activity::is_releasing() {
+        fire_parks(parks.collect());
+        return;
+    }
+    RELEASED_THUMBNAILS.with_borrow_mut(|released| {
+        released.retain(|park| request_is_live(&park.target));
+        released.extend(parks);
+    });
+    RELEASES.with_borrow_mut(|releases| {
+        releases.get_or_insert_with(|| {
+            crate::services::file_activity::observe(|notice| {
+                if let crate::services::file_activity::Notice::Lifted(_) = notice {
+                    fire_parks(RELEASED_THUMBNAILS.take());
+                }
+            })
+        });
+    });
 }
 
 fn retry_deferred_thumbnails() {
@@ -1193,6 +1271,8 @@ fn forget_slot(image_id: usize) {
 }
 
 pub(super) fn show_fallback_icon(image: &ThumbnailSlot, icon: &str, size: i32) {
+    viewport::cancel_metadata(image.as_ptr() as usize);
+    image.set_thumbnail_source(None);
     set_fallback_icon(image, None, icon, size);
 }
 
@@ -1202,6 +1282,8 @@ pub(super) fn show_customized_icon(
     fallback_icon: &str,
     size: i32,
 ) {
+    viewport::cancel_metadata(image.as_ptr() as usize);
+    image.set_thumbnail_source(None);
     set_fallback_icon(image, Some(path), fallback_icon, size);
 }
 
@@ -1262,6 +1344,7 @@ pub(super) fn cancel_list_item_thumbnails(item: &glib::Object) {
 
 pub(super) fn cancel_thumbnails_in(widget: &gtk::Widget) {
     if let Some(image) = widget.downcast_ref::<ThumbnailSlot>() {
+        image.set_thumbnail_source(None);
         cancel_thumbnail(image.as_ptr() as usize);
     }
     let mut child = widget.first_child();
@@ -1274,7 +1357,8 @@ pub(super) fn cancel_thumbnails_in(widget: &gtk::Widget) {
 fn prepare_thumbnail_target(image: &ThumbnailSlot, size: i32) -> (usize, u64) {
     let request = NEXT_REQUEST.fetch_add(1, Ordering::Relaxed);
     let image_id = image.as_ptr() as usize;
-    cancel_thumbnail(image_id);
+    // Refreshing artwork must not discard the bound row's pending metadata.
+    cancel_thumbnail_request(image_id);
     image.set_slot(size);
     (image_id, request)
 }
@@ -1538,6 +1622,10 @@ fn refresh_tracked_icons(matches: impl Fn(&TrackedCustomizedIcon) -> bool) {
 
 fn cancel_thumbnail(image_id: usize) {
     viewport::cancel_metadata(image_id);
+    cancel_thumbnail_request(image_id);
+}
+
+fn cancel_thumbnail_request(image_id: usize) {
     ACTIVE_REQUESTS.with(|requests| {
         requests.borrow_mut().remove(&image_id);
     });

@@ -67,10 +67,13 @@ pub(in crate::ui) fn entry_model_value(entry: &FileEntry) -> String {
         'f'
     };
     let hidden = if entry.is_hidden { 'h' } else { 'v' };
+    let entry_type = crate::services::entry_type(entry);
+    let group = entry_type.description();
     let name = entry.display_name.as_str();
-    let mut value = String::with_capacity(name.len() + 3);
+    let mut value = String::with_capacity(group.len() + name.len() + 3);
     value.push(kind);
     value.push(hidden);
+    value.push_str(group);
     value.push('\t');
     value.push_str(name);
     value
@@ -88,25 +91,15 @@ pub(in crate::ui) fn model_is_hidden(value: &str) -> bool {
     value.as_bytes().get(1) == Some(&b'h')
 }
 
-fn model_is_broken_link(value: &str) -> bool {
-    value.starts_with("x")
-}
-
 pub(in crate::ui) const FOLDER_TYPE_GROUP: &str = crate::services::FOLDER_TYPE_NAME;
 pub(in crate::ui) const OTHER_TYPE_GROUP: &str = crate::services::OTHER_TYPE_NAME;
 
-pub(in crate::ui) fn model_type_group(value: &str) -> String {
-    if model_is_directory(value) {
-        return FOLDER_TYPE_GROUP.to_owned();
-    }
-    if model_is_broken_link(value) {
-        return crate::services::BROKEN_LINK_TYPE_NAME.to_owned();
-    }
-    if value.starts_with('o') {
-        return OTHER_TYPE_GROUP.to_owned();
-    }
-    let name = model_display_name(value);
-    crate::services::mime_description_for_name(name)
+/// Empty for a value without a group, such as an empty model value.
+pub(in crate::ui) fn model_type_group(value: &str) -> &str {
+    value
+        .get(2..)
+        .and_then(|rest| rest.split_once('\t'))
+        .map_or("", |(group, _)| group)
 }
 
 pub(in crate::ui) fn entry_filter(
@@ -346,11 +339,16 @@ pub(super) fn item_count_label(count: usize) -> String {
 }
 
 pub(super) fn entry_kind_summary(entries: &[FileEntry]) -> String {
-    let directories = entries.iter().filter(|entry| entry.is_directory()).count();
-    let files = entries.len().saturating_sub(directories);
+    let directories = entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::Directory)
+        .count();
+    let files = entries.iter().filter(|entry| entry.is_file()).count();
     match (files, directories) {
-        (files, 0) => crate::i18n::count("files", files),
-        (0, directories) => crate::i18n::count("folders", directories),
+        (files, 0) if files == entries.len() => crate::i18n::count("files", files),
+        (0, directories) if directories == entries.len() => {
+            crate::i18n::count("folders", directories)
+        }
         _ => item_count_label(entries.len()),
     }
 }
@@ -361,7 +359,7 @@ pub(super) async fn aggregate_directory_summary(entries: &[FileEntry]) -> Direct
         if index > 0 && index % 256 == 0 {
             glib::timeout_future(std::time::Duration::ZERO).await;
         }
-        if entry.is_directory() {
+        if entry.kind == EntryKind::Directory {
             let directory = gio_file_for_location(&entry.location);
             match summarize_directory(&directory).await {
                 Ok(summary) => {
@@ -387,7 +385,9 @@ pub(super) async fn aggregate_directory_summary(entries: &[FileEntry]) -> Direct
                     total.total_size = total.total_size.saturating_add(size);
                 }
                 MetadataValue::Unknown | MetadataValue::Unavailable => {
-                    total.issues.unreadable = true;
+                    if !entry.is_symbolic_link() {
+                        total.issues.unreadable = true;
+                    }
                 }
             }
         }

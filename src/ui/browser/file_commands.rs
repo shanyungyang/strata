@@ -61,6 +61,30 @@ pub(crate) enum CreateRefusal {
     Unsupported,
     Invalid(&'static str),
     Exists(String),
+    Unstorable(String),
+}
+
+pub(crate) struct TypedEntry {
+    parent: Location,
+    name: String,
+    directory: bool,
+}
+
+impl TypedEntry {
+    /// The operation still checks collisions atomically; this keeps the name editable.
+    pub(crate) async fn refusal(&self) -> Option<CreateRefusal> {
+        let folder = gio_file_for_location(&self.parent);
+        if let Some(message) =
+            crate::adapters::typed_name_refusal(&folder, &self.name, self.directory).await
+        {
+            return Some(CreateRefusal::Unstorable(message));
+        }
+        let path = self.parent.native_path()?.join(&self.name);
+        let exists = gtk::gio::spawn_blocking(move || std::fs::symlink_metadata(path).is_ok())
+            .await
+            .unwrap_or(false);
+        exists.then(|| CreateRefusal::Exists(self.name.clone()))
+    }
 }
 
 impl BrowserView {
@@ -78,13 +102,17 @@ impl BrowserView {
     }
 
     pub fn create_new_folder_for_selection(&self) -> bool {
-        let entries = self.command_targets();
-        if entries.is_empty() {
+        if self.selected_search_results().is_some() {
             return false;
         }
         let Some((depth, _)) = self.new_entry_parent() else {
             return false;
         };
+        self.state.sync_mode_selection();
+        let entries = self.state.browser.filled_entries(depth);
+        if entries.is_empty() {
+            return false;
+        }
         self.state.new_folder_with_selection(depth, &entries)
     }
 
@@ -168,7 +196,7 @@ impl BrowserView {
             .is_some_and(|(_, parent)| !is_trash_location(&parent) && !parent.is_recent_location())
     }
 
-    pub fn create_typed_entry(&self, text: &str) -> Result<(), CreateRefusal> {
+    pub fn prepare_typed_entry(&self, text: &str) -> Result<TypedEntry, CreateRefusal> {
         let (name, directory) = match text.strip_suffix('/') {
             Some(name) => (name, true),
             None => (text, false),
@@ -180,16 +208,17 @@ impl BrowserView {
         else {
             return Err(CreateRefusal::Unsupported);
         };
-        // The operation still checks collisions atomically; this provides editable feedback.
-        if let Some(path) = parent.native_path()
-            && std::fs::symlink_metadata(path.join(name)).is_ok()
-        {
-            return Err(CreateRefusal::Exists(name.to_owned()));
-        }
+        Ok(TypedEntry {
+            parent,
+            name: name.to_owned(),
+            directory,
+        })
+    }
+
+    pub fn create_typed_entry(&self, entry: TypedEntry) {
         self.state
             .browser
-            .create_exact_entry(parent, name.to_owned(), directory);
-        Ok(())
+            .create_exact_entry(entry.parent, entry.name, entry.directory);
     }
 }
 
@@ -197,33 +226,44 @@ pub(crate) fn can_rename(entry: &FileEntry) -> bool {
     !is_trash_location(&entry.location)
 }
 
+pub(crate) struct TypedRename {
+    pub(crate) entry: FileEntry,
+    pub(crate) name: String,
+}
+
+impl TypedRename {
+    pub(crate) fn native_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        let current = self.entry.location.native_path()?;
+        let wanted = current.parent()?.join(&self.name);
+        Some((current.to_path_buf(), wanted))
+    }
+}
+
 impl BrowserView {
-    /// Renames `entry` to exactly `text`. An unchanged name does nothing, and an
-    /// invalid or occupied one is refused before anything is renamed; the
-    /// operation's own failures are reported like an inline rename's.
-    pub fn rename_typed_entry(&self, entry: FileEntry, text: &str) -> Result<(), CreateRefusal> {
+    pub fn prepare_typed_rename(
+        &self,
+        entry: FileEntry,
+        text: &str,
+    ) -> Result<Option<TypedRename>, CreateRefusal> {
         if !can_rename(&entry) {
             return Err(CreateRefusal::Unsupported);
         }
         crate::services::validate_basename(text).map_err(CreateRefusal::Invalid)?;
         if entry.display_name == text || entry.native_name == std::ffi::OsStr::new(text) {
-            return Ok(());
+            return Ok(None);
         }
-        // The rename itself refuses to replace; this only keeps the prompt open to fix the name.
-        if let Some(parent) = entry
-            .location
-            .native_path()
-            .and_then(std::path::Path::parent)
-            && std::fs::symlink_metadata(parent.join(text)).is_ok()
-        {
-            return Err(CreateRefusal::Exists(text.to_owned()));
-        }
-        if let Some(request) = self.state.browser.rename(entry, text.to_owned()) {
+        Ok(Some(TypedRename {
+            entry,
+            name: text.to_owned(),
+        }))
+    }
+
+    pub fn start_typed_rename(&self, rename: TypedRename) {
+        if let Some(request) = self.state.browser.rename(rename.entry, rename.name) {
             self.state
                 .keyboard_refocus
                 .set(Some(KeyboardRefocus::Rename(request)));
         }
-        Ok(())
     }
 }
 
@@ -400,8 +440,7 @@ impl BrowserView {
                 &state.overlay,
                 files,
                 applications.content_types,
-                applications.recommended,
-                applications.other,
+                applications.choices,
                 crate::ui::open_with::OpenWithContext::Explicit,
                 Rc::new(move || {
                     if let Some(browser) = browser.upgrade() {

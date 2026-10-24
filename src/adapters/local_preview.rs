@@ -14,6 +14,7 @@ use gtk::{gio, glib, prelude::*};
 
 use crate::{
     adapters::{
+        gio_close::Closing,
         gio_file_for_location,
         local_operations::{ArchiveListingStatus, decode_archive_listing},
     },
@@ -258,16 +259,24 @@ impl LocalPreviewProvider {
             let sample = match entry.location.native_path() {
                 Some(path) => {
                     let path = path.to_path_buf();
-                    gio::spawn_blocking(move || read_head_sample(&path))
-                        .await
-                        .ok()
-                        .flatten()
+                    match gio::spawn_blocking(move || read_head_sample(&path)).await {
+                        Ok(Ok(sample)) => Some(sample),
+                        Ok(Err(error)) if crate::services::file_activity::is_refusal(&error) => {
+                            emit(PreviewEvent::Failed {
+                                request_id,
+                                entry,
+                                message: crate::services::file_activity::HELD_FOR_OPERATION
+                                    .to_owned(),
+                            });
+                            return;
+                        }
+                        _ => None,
+                    }
                 }
                 None => None,
             };
-            let (guessed_type, uncertain) =
-                gio::content_type_guess(Some(Path::new(&entry.native_name)), None::<&[u8]>);
-            let mut content_type = guessed_type.to_string();
+            let (mut content_type, uncertain) =
+                crate::services::guess_content_type(Path::new(&entry.native_name));
             let mut content = content_family(&content_type);
             if crate::services::is_model(&entry.native_name) {
                 content = PreviewContent::Unsupported;
@@ -538,6 +547,7 @@ impl LocalPreviewProvider {
                 format,
                 size: MediaPreviewSize::new(request.media_size.width.min(800), request.media_size.height.min(800)),
                 palette: request.model_palette,
+                view: request.model_view,
             });
             let operation = if let Some(render) = model {
                 Some(ParseOperation::PreviewModel(render))
@@ -547,6 +557,11 @@ impl LocalPreviewProvider {
                 PreviewContent::Pdf { .. } => Some(ParseOperation::PreviewPdf(pdf_render_size(
                     request.media_size,
                 ))),
+                PreviewContent::Image
+                    if crate::sandbox::raw_metadata::is_raw(Path::new(&entry.native_name)) =>
+                {
+                    Some(ParseOperation::PreviewRaw)
+                }
                 PreviewContent::Image => Some(ParseOperation::PreviewImage),
                 PreviewContent::Media => None,
                 PreviewContent::Text { .. }
@@ -560,7 +575,10 @@ impl LocalPreviewProvider {
             }};
             if let Some(operation) = &operation {
                 let staged = if entry.location.native_path().is_none() {
-                    if !matches!(operation, ParseOperation::PreviewImage) {
+                    if !matches!(
+                        operation,
+                        ParseOperation::PreviewImage | ParseOperation::PreviewRaw
+                    ) {
                         emit(PreviewEvent::Failed {
                             request_id,
                             entry,
@@ -666,6 +684,7 @@ impl LocalPreviewProvider {
                 content = match render {
                     Ok(Ok(output)) if model.is_some() => PreviewContent::Model {
                         png: output.data,
+                        mesh: output.model_mesh,
                     },
                     Ok(Ok(output)) if matches!(operation, ParseOperation::PreviewPdf(_)) => {
                         if let Some(mtime) = modified
@@ -857,7 +876,7 @@ async fn read_text(
                     &crate::services::io_error_message(&error),
                 )
             };
-            let file = std::fs::File::open(&path).map_err(io_failure)?;
+            let file = crate::services::file_activity::open(&path).map_err(io_failure)?;
             let mut bytes = Vec::new();
             file.take(byte_limit as u64 + 1)
                 .read_to_end(&mut bytes)
@@ -877,7 +896,12 @@ async fn read_text(
             }
         }
     }
-    let stream = file.read_future(glib::Priority::DEFAULT).await?;
+    let stream = gio::GioFuture::new(file, |file, cancellable, result| {
+        file.read_async(glib::Priority::DEFAULT, Some(cancellable), move |output| {
+            result.resolve(output.map(|stream| Closing::new(stream.upcast::<gio::InputStream>())));
+        });
+    })
+    .await?;
     let bytes = stream
         .read_bytes_future(byte_limit.saturating_add(1), glib::Priority::DEFAULT)
         .await?;

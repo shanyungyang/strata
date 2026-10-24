@@ -18,7 +18,9 @@ use crate::{
     services::{
         ArchivePreviewTree, DocumentLayout, LoadHandle, MediaPreviewSize, PdfTextLayer, Preview,
         PreviewContent, PreviewEvent, PreviewProvider, PreviewRequest, PreviewRequestId,
-        SecretString, normalize_preview_text,
+        SecretString,
+        file_activity::{self, Notice},
+        normalize_preview_text,
     },
 };
 
@@ -36,15 +38,18 @@ use super::{
 
 mod archive;
 pub(super) mod audio;
+mod components;
 mod ease_in;
 mod find;
 mod keyboard;
 mod layout;
 pub(in crate::ui) use layout::{separator, separator_width};
 pub(in crate::ui) mod media_layout;
+mod model;
 #[cfg(test)]
 mod pdf_ranges_tests;
 mod pdf_text;
+mod player_layout;
 mod session;
 pub(super) mod video;
 mod waveform;
@@ -206,6 +211,9 @@ struct PreviewState {
     media_toggle_mute: RefCell<Option<Rc<dyn Fn()>>>,
     audio: RefCell<Option<AudioPreview>>,
     video: RefCell<Option<VideoPreview>>,
+    model: RefCell<Option<model::ModelPreview>>,
+    model_spinner: gtk::Spinner,
+    model_view: Cell<crate::services::ModelView>,
     handed_off: RefCell<Option<crate::model::Location>>,
     continue_playback: RefCell<Option<PlaybackContinuation>>,
     split: RefCell<Option<gtk::Paned>>,
@@ -215,7 +223,6 @@ struct PreviewState {
     pending_show: RefCell<Option<glib::SourceId>>,
     load: RefCell<Option<LoadHandle>>,
     loading_delay: RefCell<Option<glib::SourceId>>,
-    loading_label: RefCell<Option<gtk::Label>>,
     pdf_loads: Rc<RefCell<HashMap<i32, LoadHandle>>>,
     print_load: RefCell<Option<LoadHandle>>,
     print_progress: RefCell<Option<PrintProgress>>,
@@ -232,6 +239,8 @@ struct PreviewState {
     animation_generation: Rc<Cell<u64>>,
     keyboard_view: RefCell<Option<super::browser::WeakBrowserView>>,
     claim_on_resume: Cell<bool>,
+    released_from: Cell<Option<Option<usize>>>,
+    operations: RefCell<Option<file_activity::Subscription>>,
 }
 
 use keyboard::MediaSeek;
@@ -275,6 +284,12 @@ impl PreviewDrawer {
         )));
         open.add_css_class("preview-header-action");
         open.set_visible(allow_external_open);
+        let model_spinner = gtk::Spinner::builder()
+            .valign(gtk::Align::Center)
+            .visible(false)
+            .build();
+        model_spinner.add_css_class("preview-spinner");
+        model_spinner.add_css_class("preview-header-spinner");
         let document_view_icon = crate::assets::primary_icon(crate::assets::icons::FILE_CODE, 16);
         let document_view_button = gtk::Button::builder()
             .tooltip_text(crate::i18n::tr("View source"))
@@ -348,6 +363,7 @@ impl PreviewDrawer {
         find_button.set_visible(false);
         header.append(&document_view_button);
         header.append(&find_button);
+        header.append(&model_spinner);
         header.append(&open);
         header.append(&print);
         header.append(&wrap);
@@ -445,7 +461,6 @@ impl PreviewDrawer {
             pending_show: RefCell::new(None),
             load: RefCell::new(None),
             loading_delay: RefCell::new(None),
-            loading_label: RefCell::new(None),
             pdf_loads: Rc::new(RefCell::new(HashMap::new())),
             print_load: RefCell::new(None),
             print_progress: RefCell::new(None),
@@ -465,9 +480,14 @@ impl PreviewDrawer {
             keyboard_view: RefCell::new(None),
             audio: RefCell::new(None),
             video: RefCell::new(None),
+            model: RefCell::new(None),
+            model_spinner,
+            model_view: Cell::default(),
             handed_off: RefCell::new(None),
             continue_playback: RefCell::new(None),
             claim_on_resume: Cell::new(false),
+            released_from: Cell::new(None),
+            operations: RefCell::new(None),
         });
         let weak = Rc::downgrade(&state);
         state.enabled_action.connect_activate(move |_, _| {
@@ -597,7 +617,57 @@ impl PreviewDrawer {
         self.state.media.borrow().clone()
     }
 
+    pub(in crate::ui) fn follow_operations(&self, browser: &Rc<Browser>) {
+        let weak_state = Rc::downgrade(&self.state);
+        let weak_browser = Rc::downgrade(browser);
+        let subscription = file_activity::observe(move |notice| {
+            let Some(state) = weak_state.upgrade() else {
+                return;
+            };
+            match notice {
+                Notice::Releasing(_) => {
+                    let changing = state.current.borrow().as_ref().is_some_and(|entry| {
+                        entry
+                            .local_thumbnail_path()
+                            .is_some_and(|path| notice.covers(path))
+                    });
+                    if changing {
+                        let depth = state.current_depth.get();
+                        state.clear_target();
+                        state.released_from.set(Some(depth));
+                    }
+                }
+                Notice::Lifted(_) => {
+                    let Some(depth) = state.released_from.get() else {
+                        return;
+                    };
+                    let Some(browser) = weak_browser.upgrade() else {
+                        return;
+                    };
+                    let depth = depth.or_else(|| browser.active_depth());
+                    let entry = depth
+                        .and_then(|depth| browser.cursor_entry(depth))
+                        .and_then(|entry| preview_target(Some(entry)));
+                    if entry
+                        .as_ref()
+                        .and_then(FileEntry::local_thumbnail_path)
+                        .is_some_and(file_activity::is_changing)
+                    {
+                        return;
+                    }
+                    state.released_from.set(None);
+                    if let Some(entry) = entry.filter(|_| state.is_enabled()) {
+                        state.show_after_focus_change(entry, depth);
+                    }
+                }
+                Notice::Ended(_) => {}
+            }
+        });
+        self.state.operations.replace(Some(subscription));
+    }
+
     pub fn observe_browser(&self, browser: &Rc<Browser>) {
+        self.follow_operations(browser);
         let weak_state = Rc::downgrade(&self.state);
         let weak_browser = Rc::downgrade(browser);
         self.state.open.connect_clicked(move |_| {
@@ -896,6 +966,8 @@ impl PreviewState {
             .is_none_or(|current| current.location != entry.location)
         {
             self.reset_find();
+            self.model_view.set(Default::default());
+            self.model.borrow_mut().take();
         }
         self.cancel_pending_show();
         self.retain_pending_playback(&entry);
@@ -1143,6 +1215,7 @@ impl PreviewState {
                 pdf_page,
                 media_size: self.media_preview_size(),
                 model_palette: super::theme::ThemeManager::shared().active_model_palette(),
+                model_view: Default::default(),
                 archive_password: None,
             },
             emit,
@@ -1317,7 +1390,17 @@ impl PreviewState {
         render_document: bool,
         archive_password: Option<SecretString>,
     ) {
+        if self
+            .current
+            .borrow()
+            .as_ref()
+            .is_none_or(|current| current.location != entry.location)
+        {
+            self.model_view.set(Default::default());
+            self.model.borrow_mut().take();
+        }
         self.raw_metadata_load.borrow_mut().take();
+        self.released_from.set(None);
         if super::raw_details::supports(&entry) {
             let load = self
                 .raw_details
@@ -1340,7 +1423,9 @@ impl PreviewState {
         );
         self.size.set_text(&metadata_size(&entry));
         crate::util::set_modified_date(&self.modified, Some(&entry), "—");
-        self.content_type.set_text(file_extension(&entry));
+        if self.model.borrow().is_none() {
+            self.content_type.set_text(file_extension(&entry));
+        }
         self.load.borrow_mut().take();
         self.pdf_loads.borrow_mut().clear();
 
@@ -1372,6 +1457,7 @@ impl PreviewState {
                 pdf_page,
                 media_size: self.media_preview_size(),
                 model_palette: super::theme::ThemeManager::shared().active_model_palette(),
+                model_view: self.model_view.get(),
                 archive_password,
             },
             emit,
@@ -1391,8 +1477,8 @@ impl PreviewState {
         }
         match event {
             PreviewEvent::Progress { stage, .. } => {
-                if let Some(label) = self.loading_label.borrow().as_ref() {
-                    label.set_text(&stage.label());
+                if let Some(model) = self.model.borrow().as_ref() {
+                    model.set_progress(stage);
                 }
             }
             PreviewEvent::Ready(preview) if preview.request_id == expected => {
@@ -1412,9 +1498,27 @@ impl PreviewState {
                 // Failures carry English source messages: known ones have catalog
                 // entries, and system error text passes through unchanged.
                 let detail = crate::i18n::tr(&message);
+                if let Some(model) = self
+                    .model
+                    .borrow()
+                    .as_ref()
+                    .filter(|model| model.picture.paintable().is_some())
+                {
+                    self.model_view.set(model.view());
+                    model.show_error(&detail);
+                    return;
+                }
                 if message == crate::services::INCORRECT_ARCHIVE_PASSWORD {
                     self.render_archive_password_prompt(entry, Some(&detail));
+                } else if message == file_activity::HELD_FOR_OPERATION
+                    && !file_activity::is_releasing()
+                {
+                    self.current_request.set(None);
+                    self.show_after_focus_change(entry, self.current_depth.get());
                 } else {
+                    if message == file_activity::HELD_FOR_OPERATION {
+                        self.released_from.set(Some(self.current_depth.get()));
+                    }
                     self.current_request.set(None);
                     let title = crate::i18n::tr("Preview unavailable");
                     if !self.show_audio_error(&title, &detail, None)
@@ -1438,6 +1542,10 @@ impl PreviewState {
     }
 
     fn render_archive_password_prompt(self: &Rc<Self>, entry: FileEntry, error: Option<&str>) {
+        let focus_prompt = self
+            .focus_archive_request
+            .take()
+            .is_some_and(|request| self.current_request.get() == Some(request));
         self.clear_content();
         self.content_type.set_text(file_extension(&entry));
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 8);
@@ -1512,7 +1620,11 @@ impl PreviewState {
 
         self.password_entry.replace(Some(password.clone()));
         self.content.append(&box_);
-        password.grab_focus();
+        if focus_prompt {
+            password.grab_focus();
+        } else {
+            self.hand_keys_to(&password);
+        }
         self.reassert_keyboard_owner();
     }
 
@@ -1522,11 +1634,15 @@ impl PreviewState {
             .take()
             .is_some_and(|pending| pending.request == Some(preview.request_id));
         self.content_type.set_text(&preview.content_type);
-        self.reset_content(
-            matches!(preview.content, PreviewContent::SandboxedMedia { .. })
-                .then(|| media_family(&preview.content_type))
-                .flatten(),
-        );
+        let reuse_model = matches!(preview.content, PreviewContent::Model { mesh: Some(_), .. })
+            && self.model.borrow().is_some();
+        if !reuse_model {
+            self.reset_content(
+                matches!(preview.content, PreviewContent::SandboxedMedia { .. })
+                    .then(|| media_family(&preview.content_type))
+                    .flatten(),
+            );
+        }
         match preview.content {
             PreviewContent::Text { content, truncated } => {
                 self.print.set_visible(true);
@@ -1583,7 +1699,8 @@ impl PreviewState {
                 self.rendered_text.replace(Some(state));
                 self.content.append(&view);
             }
-            PreviewContent::Rasterized { png } | PreviewContent::Model { png, .. } => {
+            PreviewContent::Model { png, mesh } => self.render_model(png, mesh),
+            PreviewContent::Rasterized { png } => {
                 let model = crate::services::is_model(&preview.entry.native_name);
                 let cover =
                     crate::sandbox::CoverFormat::for_name(&preview.entry.native_name).is_some();
@@ -1760,15 +1877,7 @@ impl PreviewState {
             }
         });
         let browser = archive::ArchiveBrowser::new(tree, navigate, open);
-        if !focus_tree
-            && !self.content.has_focus()
-            && self
-                .keyboard_view
-                .borrow()
-                .as_ref()
-                .and_then(|view| view.upgrade())
-                .is_some_and(|view| view.view_mode() == super::browser_modes::BrowserMode::Columns)
-        {
+        if !focus_tree && !self.content.has_focus() {
             browser.clear_selection();
         }
         let list = browser.list().clone();
@@ -2260,6 +2369,7 @@ impl PreviewState {
                     pdf_page: page_index,
                     media_size: render_size,
                     model_palette: super::theme::ThemeManager::shared().active_model_palette(),
+                    model_view: Default::default(),
                     archive_password: None,
                 },
                 emit,
@@ -2941,6 +3051,7 @@ impl PreviewState {
     }
 
     fn reset_content(&self, keep: Option<MediaFamily>) {
+        self.model.borrow_mut().take();
         let owned = self.content_owns_keys();
         self.detach_find();
         self.rendered_text.borrow_mut().take();
@@ -2995,6 +3106,11 @@ impl PreviewState {
     }
 
     fn show_loading(self: &Rc<Self>, request_id: PreviewRequestId) {
+        if let Some(model) = self.model.borrow().as_ref() {
+            self.cancel_loading();
+            model.set_loading(self.model_view.get());
+            return;
+        }
         let family = self.current.borrow().as_ref().and_then(entry_family);
         self.reset_content(family);
         self.cancel_loading();
@@ -3012,18 +3128,10 @@ impl PreviewState {
             }
             return;
         }
-        let weak = Rc::downgrade(self);
-        if self
-            .current
-            .borrow()
-            .as_ref()
-            .is_some_and(|entry| crate::services::is_model(&entry.native_name))
-        {
-            let label = gtk::Label::new(Some(&crate::i18n::tr("Waiting for preview…")));
-            label.add_css_class("preview-feedback-detail");
-            label.set_wrap(true);
-            self.loading_label.replace(Some(label));
+        if self.show_model_loading() {
+            return;
         }
+        let weak = Rc::downgrade(self);
         let source = glib::timeout_add_local_once(PREVIEW_SPINNER_DELAY, move || {
             let Some(state) = weak.upgrade() else {
                 return;
@@ -3037,24 +3145,13 @@ impl PreviewState {
             spinner.set_halign(gtk::Align::Center);
             spinner.set_valign(gtk::Align::Center);
             spinner.start();
-            if let Some(label) = state.loading_label.borrow().as_ref() {
-                let loading = gtk::Box::new(gtk::Orientation::Vertical, 12);
-                loading.set_halign(gtk::Align::Center);
-                loading.set_valign(gtk::Align::Center);
-                loading.set_vexpand(true);
-                loading.append(&spinner);
-                loading.append(label);
-                state.content.append(&loading);
-            } else {
-                spinner.set_vexpand(true);
-                state.content.append(&spinner);
-            }
+            spinner.set_vexpand(true);
+            state.content.append(&spinner);
         });
         self.loading_delay.replace(Some(source));
     }
 
     fn cancel_loading(&self) {
-        self.loading_label.borrow_mut().take();
         if let Some(source) = self.loading_delay.borrow_mut().take() {
             source.remove();
         }
@@ -3574,8 +3671,7 @@ fn document_view_action(view: DocumentView) -> (&'static str, &'static str) {
 
 impl SourcePreviewView {
     fn new() -> Self {
-        let buffer = sourceview5::Buffer::new(None);
-        super::theme::register_source_buffer(&buffer);
+        let buffer = super::theme::new_source_buffer();
         let view = sourceview5::View::builder()
             .buffer(&buffer)
             .cursor_visible(true)
@@ -3615,7 +3711,7 @@ impl SourcePreviewView {
                 self.view.unparent();
             }
         }
-        let languages = sourceview5::LanguageManager::default();
+        let languages = super::theme::source_languages();
         let language = languages.guess_language(entry.location.native_path(), Some(content_type));
         if language.is_none() && super::virtual_preview::use_virtual_plain_source(content) {
             let wrapped = super::preferences::PreferenceManager::shared().preview_text_wrap();
@@ -3625,8 +3721,7 @@ impl SourcePreviewView {
             return (container.upcast(), true);
         }
         let display = normalize_preview_text(content).into_owned();
-        let buffer = sourceview5::Buffer::new(None);
-        super::theme::register_source_buffer(&buffer);
+        let buffer = super::theme::new_source_buffer();
         buffer.set_highlight_syntax(false);
         buffer.set_language(language.as_ref());
         self.view.set_buffer(Some(&buffer));

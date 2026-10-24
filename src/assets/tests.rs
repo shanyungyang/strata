@@ -162,8 +162,11 @@ fn cold_interface_icons_render_when_decoder_workers_cannot_start() {
             )
             .expect("bundled icon resources");
             assert!(!names.is_empty());
-            for resource in names {
-                let name = resource.strip_suffix(".svg").expect("bundled SVG icon");
+            let names = names
+                .iter()
+                .map(|resource| resource.strip_suffix(".svg").expect("bundled SVG icon"))
+                .chain([icons::STRATA_LOGO]);
+            for name in names {
                 let image = super::primary_icon(name, 18);
                 let first = image
                     .paintable()
@@ -195,6 +198,50 @@ fn cold_interface_icons_render_when_decoder_workers_cannot_start() {
             assert!(folder_decoration_paintable(icons::PICTURES, "#d46b31").is_some());
             assert!(super::emoji_icon_paintable("🚀").is_some());
             assert!(folder_decoration_paintable("emoji:🚀", "#d46b31").is_some());
+        },
+    );
+}
+
+#[test]
+fn nested_spin_button_steps_resolve_to_bundled_icons() {
+    crate::test_support::gtk_test(
+        "assets::tests::nested_spin_button_steps_resolve_to_bundled_icons",
+        || {
+            let spin = gtk::SpinButton::with_range(0.0, 10.0, 1.0);
+            let container = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            container.append(&spin);
+            super::use_bundled_spin_icons(&container);
+
+            let display = gtk::gdk::Display::default().expect("display");
+            let theme = gtk::IconTheme::for_display(&display);
+            let mut steps = Vec::new();
+            let mut child = spin.first_child();
+            while let Some(widget) = child {
+                child = widget.next_sibling();
+                let Some(button) = widget.downcast_ref::<gtk::Button>() else {
+                    continue;
+                };
+                let name = button.icon_name().expect("step icon").to_string();
+                let uri = theme
+                    .lookup_icon(
+                        &name,
+                        &[],
+                        16,
+                        1,
+                        gtk::TextDirection::Ltr,
+                        gtk::IconLookupFlags::empty(),
+                    )
+                    .file()
+                    .expect("resolved icon file")
+                    .uri();
+                assert!(
+                    uri.starts_with("resource:///io/github/lgse/Strata/icons/"),
+                    "{name} resolved outside the bundle: {uri}"
+                );
+                steps.push(name);
+            }
+            steps.sort();
+            assert_eq!(steps, [icons::MINUS_SYMBOLIC, icons::PLUS_SYMBOLIC]);
         },
     );
 }
