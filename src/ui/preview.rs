@@ -50,6 +50,7 @@ mod model;
 mod pdf_ranges_tests;
 mod pdf_text;
 mod player_layout;
+mod route;
 mod session;
 pub(super) mod video;
 mod waveform;
@@ -96,7 +97,9 @@ pub(crate) fn entry_supports_quick_preview(entry: &FileEntry) -> bool {
     if !matches!(entry.kind, EntryKind::File | EntryKind::FileSymbolicLink) {
         return false;
     }
-    if crate::services::is_model(&entry.native_name) {
+    if crate::services::is_model(entry)
+        || crate::services::route_preview::RouteFormat::for_name(&entry.native_name).is_some()
+    {
         return entry.location.native_path().is_some();
     }
     if crate::sandbox::CoverFormat::for_name(&entry.native_name).is_some() {
@@ -108,7 +111,7 @@ pub(crate) fn entry_supports_quick_preview(entry: &FileEntry) -> bool {
         gio::content_type_guess(Some(Path::new(&entry.native_name)), None::<&[u8]>);
     let content = crate::services::content_family(&content_type);
     if crate::services::table::is_workbook(&content_type, &entry.native_name)
-        || crate::services::docx::is_document(&content_type, &entry.native_name)
+        || crate::sandbox::DocumentFormat::for_file(&content_type, &entry.native_name).is_some()
     {
         return native_path.is_some();
     }
@@ -199,6 +202,7 @@ struct PreviewState {
     raw_details_scroll: gtk::ScrolledWindow,
     raw_metadata_load: RefCell<Option<super::raw_details::MetadataLoad>>,
     open: gtk::Button,
+    allow_external_open: bool,
     print: gtk::Button,
     wrap: gtk::ToggleButton,
     text_view: RefCell<Option<sourceview5::View>>,
@@ -212,6 +216,7 @@ struct PreviewState {
     audio: RefCell<Option<AudioPreview>>,
     video: RefCell<Option<VideoPreview>>,
     model: RefCell<Option<model::ModelPreview>>,
+    route: RefCell<Option<Rc<route::RoutePlayer>>>,
     model_spinner: gtk::Spinner,
     model_view: Cell<crate::services::ModelView>,
     handed_off: RefCell<Option<crate::model::Location>>,
@@ -251,7 +256,7 @@ pub(in crate::ui) use keyboard::{
 #[cfg(test)]
 mod tests;
 
-pub(super) const PREVIEW_LABEL: &str = "Preview";
+pub(crate) const PREVIEW_LABEL: &str = "Preview";
 
 #[derive(Clone)]
 pub struct PreviewDrawer {
@@ -279,6 +284,7 @@ impl PreviewDrawer {
             .tooltip_text(crate::i18n::tr("Open in default application"))
             .valign(gtk::Align::Center)
             .build();
+        super::accessibility::set_label(&open, &crate::i18n::tr("Open in default application"));
         open.set_child(Some(&crate::assets::chrome_icon(
             crate::assets::icons::EXTERNAL_LINK,
         )));
@@ -298,13 +304,12 @@ impl PreviewDrawer {
             .build();
         document_view_button.set_child(Some(&document_view_icon));
         document_view_button.add_css_class("preview-header-action");
-        document_view_button.update_property(&[gtk::accessible::Property::Label(
-            &crate::i18n::tr("View source"),
-        )]);
+        super::accessibility::set_label(&document_view_button, &crate::i18n::tr("View source"));
         let print = gtk::Button::builder()
             .tooltip_text(crate::i18n::tr("Print"))
             .valign(gtk::Align::Center)
             .build();
+        super::accessibility::set_label(&print, &crate::i18n::tr("Print"));
         print.set_child(Some(&crate::assets::chrome_icon(
             crate::assets::icons::PRINTER,
         )));
@@ -314,6 +319,7 @@ impl PreviewDrawer {
             .tooltip_text(crate::i18n::tr("Toggle word wrap"))
             .valign(gtk::Align::Center)
             .build();
+        super::accessibility::set_label(&wrap, &crate::i18n::tr("Toggle word wrap"));
         wrap.set_child(Some(&crate::assets::chrome_icon(
             crate::assets::icons::WRAP_TEXT,
         )));
@@ -324,10 +330,12 @@ impl PreviewDrawer {
             &close,
             super::preferences::PreferenceManager::tenxer_mode,
             |close, tenxer| {
-                close.set_tooltip_text(Some(&crate::ui::shortcut_reference::with_keys(
+                let label = crate::ui::shortcut_reference::with_keys(
                     "Close preview (%{keys})",
                     keys::Keys::One(if tenxer { PEEK } else { SPACE }),
-                )));
+                );
+                close.set_tooltip_text(Some(&label));
+                super::accessibility::set_label(close, &label);
             },
         );
         close.set_child(Some(&crate::assets::chrome_icon(
@@ -444,6 +452,7 @@ impl PreviewDrawer {
             raw_details_scroll,
             raw_metadata_load: RefCell::new(None),
             open: open.clone(),
+            allow_external_open,
             print: print.clone(),
             wrap: wrap.clone(),
             text_view: RefCell::new(None),
@@ -481,6 +490,7 @@ impl PreviewDrawer {
             audio: RefCell::new(None),
             video: RefCell::new(None),
             model: RefCell::new(None),
+            route: RefCell::new(None),
             model_spinner,
             model_view: Cell::default(),
             handed_off: RefCell::new(None),
@@ -566,11 +576,18 @@ impl PreviewDrawer {
                 };
                 let entry = state.current.borrow().clone();
                 if let Some(entry) = entry
-                    && crate::services::is_model(&entry.native_name)
-                    && state.revealer.reveals_child()
+                    && (crate::services::is_model(&entry)
+                        || crate::services::route_preview::RouteFormat::for_name(
+                            &entry.native_name,
+                        )
+                        .is_some())
                     && state.current_request.get().is_some()
                 {
-                    state.load(entry, 0);
+                    if state.sizing.is_suspended() {
+                        state.sizing.defer_load();
+                    } else if state.revealer.reveals_child() {
+                        state.load(entry, 0);
+                    }
                 }
             },
         );
@@ -860,6 +877,9 @@ impl Drop for PreviewState {
 
 impl PreviewState {
     fn media_command(self: &Rc<Self>, command: MediaCommand) -> bool {
+        if let Some(route) = self.route.borrow().as_ref() {
+            return route.command(command);
+        }
         match command {
             MediaCommand::Previous => return self.step_media(-1, true),
             MediaCommand::Next => return self.step_media(1, true),
@@ -1283,6 +1303,7 @@ impl PreviewState {
                     }
                     PreviewContent::Image
                     | PreviewContent::Model { .. }
+                    | PreviewContent::Route { .. }
                     | PreviewContent::Media
                     | PreviewContent::SandboxedMedia { .. }
                     | PreviewContent::Archive { .. }
@@ -1521,7 +1542,10 @@ impl PreviewState {
                     }
                     self.current_request.set(None);
                     let title = crate::i18n::tr("Preview unavailable");
-                    if !self.show_audio_error(&title, &detail, None)
+                    if message == crate::sandbox::PDF_PASSWORD_PROTECTED && self.allow_external_open
+                    {
+                        self.show_message_with_external_open(&title, &detail);
+                    } else if !self.show_audio_error(&title, &detail, None)
                         && !self.show_video_error(&title, &detail, None)
                     {
                         self.show_message(&title, &detail);
@@ -1694,14 +1718,24 @@ impl PreviewState {
                 );
             }
             PreviewContent::Rendered { document, warnings } => {
-                let (view, state) =
-                    super::virtual_preview::rendered_document(document, warnings, false, None);
+                let word_processor = crate::sandbox::DocumentFormat::for_file(
+                    &preview.content_type,
+                    &preview.entry.native_name,
+                )
+                .is_some();
+                let (view, state) = super::virtual_preview::rendered_document(
+                    document,
+                    warnings,
+                    word_processor,
+                    None,
+                );
                 self.rendered_text.replace(Some(state));
                 self.content.append(&view);
             }
+            PreviewContent::Route { preview } => self.render_route(preview),
             PreviewContent::Model { png, mesh } => self.render_model(png, mesh),
             PreviewContent::Rasterized { png } => {
-                let model = crate::services::is_model(&preview.entry.native_name);
+                let model = crate::services::is_model(&preview.entry);
                 let cover =
                     crate::sandbox::CoverFormat::for_name(&preview.entry.native_name).is_some();
                 self.print.set_visible(!model && !cover);
@@ -1791,7 +1825,7 @@ impl PreviewState {
                         self.render_video(preview.entry, source, &media, &preferences);
                         None
                     }
-                    None => {
+                    None | Some(MediaFamily::Route) => {
                         let (overlay, center_play) = self.build_media_view(&media);
                         let section = media_layout::section(&overlay, &media);
                         self.content.append(&section);
@@ -1820,7 +1854,7 @@ impl PreviewState {
                                     audio.view.start_silently();
                                 }
                             }
-                            None => {}
+                            None | Some(MediaFamily::Route) => {}
                         }
                     }
                     self.sizing.play_or_defer(&media);
@@ -2066,8 +2100,7 @@ impl PreviewState {
         let (label, icon) = document_view_action(self.document_view.get());
         let label = crate::i18n::tr(label);
         self.document_view_button.set_tooltip_text(Some(&label));
-        self.document_view_button
-            .update_property(&[gtk::accessible::Property::Label(&label)]);
+        super::accessibility::set_label(&self.document_view_button, &label);
         crate::assets::set_primary_icon(&self.document_view_icon, icon);
     }
 
@@ -2188,9 +2221,7 @@ impl PreviewState {
             text_area.set_hexpand(true);
             text_area.set_vexpand(true);
             text_area.set_accessible_role(gtk::AccessibleRole::Img);
-            text_area.update_property(&[gtk::accessible::Property::Label(&crate::i18n::tr(
-                "PDF page text",
-            ))]);
+            super::accessibility::set_label(&text_area, &crate::i18n::tr("PDF page text"));
             let spinner = gtk::Spinner::new();
             spinner.set_halign(gtk::Align::Center);
             spinner.set_valign(gtk::Align::Center);
@@ -2690,10 +2721,13 @@ impl PreviewState {
         let pause_icon = crate::assets::primary_icon(crate::assets::icons::PAUSE, 18);
         let play_button = gtk::Button::new();
         play_button.add_css_class("preview-media-button");
-        play_button.set_tooltip_text(Some(&crate::ui::shortcut_reference::with_keys(
-            "Play/Pause (%{keys})",
-            keys::Keys::One(MEDIA_PLAY_PAUSE),
-        )));
+        super::accessibility::set_tooltip_and_label(
+            &play_button,
+            &crate::ui::shortcut_reference::with_keys(
+                "Play/Pause (%{keys})",
+                keys::Keys::One(MEDIA_PLAY_PAUSE),
+            ),
+        );
         play_button.set_child(Some(if media.is_playing() {
             &pause_icon
         } else {
@@ -2919,6 +2953,7 @@ impl PreviewState {
         self.media.borrow().is_some()
             || self.audio.borrow().is_some()
             || self.video.borrow().is_some()
+            || self.route.borrow().is_some()
     }
 
     fn stepping_family(&self) -> Option<MediaFamily> {
@@ -3051,6 +3086,9 @@ impl PreviewState {
     }
 
     fn reset_content(&self, keep: Option<MediaFamily>) {
+        if let Some(route) = self.route.borrow_mut().take() {
+            route.pause();
+        }
         self.model.borrow_mut().take();
         let owned = self.content_owns_keys();
         self.detach_find();
@@ -3072,7 +3110,7 @@ impl PreviewState {
         let retained = match keep {
             Some(MediaFamily::Audio) => audio.is_some(),
             Some(MediaFamily::Video) => video.is_some(),
-            None => false,
+            None | Some(MediaFamily::Route) => false,
         };
         if !retained {
             self.media_toggle_mute.replace(None);
@@ -3221,13 +3259,25 @@ impl PreviewState {
         self.show_message_with_icon(title, detail, None, None);
     }
 
+    fn show_message_with_external_open(&self, title: &str, detail: &str) {
+        let feedback = self.show_message_with_icon(title, detail, None, None);
+        let open = gtk::Button::with_label(&crate::i18n::tr("Open"));
+        open.add_css_class("suggested-action");
+        open.add_css_class("preview-feedback-action");
+        open.set_halign(gtk::Align::Center);
+        let header_open = self.open.clone();
+        open.connect_clicked(move |_| header_open.emit_clicked());
+        feedback.append(&open);
+        self.hand_keys_to(&open);
+    }
+
     fn show_message_with_icon(
         &self,
         title: &str,
         detail: &str,
         icon: Option<&str>,
         command: Option<&str>,
-    ) {
+    ) -> gtk::Box {
         self.clear_content();
         let box_ = gtk::Box::new(gtk::Orientation::Vertical, 7);
         box_.add_css_class("preview-feedback");
@@ -3252,6 +3302,7 @@ impl PreviewState {
             box_.append(&super::controls::copyable_command(command));
         }
         self.content.append(&box_);
+        box_
     }
 }
 
@@ -3269,10 +3320,13 @@ impl VolumeControls {
     ) -> Self {
         let toggle = gtk::Button::new();
         toggle.add_css_class("preview-media-button");
-        toggle.set_tooltip_text(Some(&crate::ui::shortcut_reference::with_keys(
-            "Mute/unmute (%{keys})",
-            keys::Keys::One(MEDIA_MUTE),
-        )));
+        super::accessibility::set_tooltip_and_label(
+            &toggle,
+            &crate::ui::shortcut_reference::with_keys(
+                "Mute/unmute (%{keys})",
+                keys::Keys::One(MEDIA_MUTE),
+            ),
+        );
         let muted = preferences.preview_muted();
         let icon = crate::assets::primary_icon(
             if muted {
@@ -3410,6 +3464,7 @@ impl ListingPosition {
 enum MediaFamily {
     Audio,
     Video,
+    Route,
 }
 
 fn media_family(content_type: &str) -> Option<MediaFamily> {
@@ -3434,6 +3489,9 @@ fn entry_family(entry: &FileEntry) -> Option<MediaFamily> {
         .and_then(|extension| extension.to_str())
         .filter(|_| !entry.is_directory())
         .map(str::to_ascii_lowercase)?;
+    if crate::services::route_preview::RouteFormat::for_name(&entry.native_name).is_some() {
+        return Some(MediaFamily::Route);
+    }
     if entry.duration_seconds == MetadataValue::Unavailable {
         return None;
     }
@@ -3861,9 +3919,7 @@ fn metadata_value(description: &str) -> gtk::Label {
     let value = gtk::Label::new(Some("—"));
     value.set_ellipsize(gtk::pango::EllipsizeMode::End);
     value.set_xalign(0.0);
-    value.update_property(&[gtk::accessible::Property::Description(&crate::i18n::tr(
-        description,
-    ))]);
+    super::accessibility::set_description(&value, Some(&crate::i18n::tr(description)));
     value
 }
 
@@ -4259,7 +4315,7 @@ fn install_preview_drag(widget: &impl IsA<gtk::Widget>, state: &Rc<PreviewState>
         {
             source.set_icon(Some(&texture), hot_x, hot_y);
         }
-        super::browser::file_drag_content(&entries)
+        super::browser::file_drag_content(source, &entries)
     });
     let weak = Rc::downgrade(state);
     drag.connect_drag_begin(move |_, _| {
