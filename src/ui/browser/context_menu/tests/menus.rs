@@ -47,6 +47,7 @@ impl FileSource for MenuSource {
                     },
                     size: MetadataValue::Known(5),
                     modified_unix_seconds: MetadataValue::Known(0),
+                    created_unix_seconds: MetadataValue::Unknown,
                     mode: MetadataValue::Known(
                         if matches!(name, "run-me" | "folder" | "photos.zip") {
                             0o755
@@ -59,6 +60,7 @@ impl FileSource for MenuSource {
                     image_dimensions: MetadataValue::Unknown,
                     child_count: MetadataValue::Unknown,
                     duration_seconds: MetadataValue::Unknown,
+                    listable: MetadataValue::Unknown,
                     recent_uri: in_recent.then(|| "recent:///notes.txt".to_owned()),
                 }
             })
@@ -310,17 +312,85 @@ fn context_hints_follow_the_active_map() {
                 ("Move to Trash", "d"),
                 ("Permanently delete", "D"),
                 ("Copy path", "Copy name"),
+                ("New Folder", "Ctrl+Shift+N"),
             ] {
                 assert_eq!(after(label), Some(hint), "{hints:?}");
             }
-            assert!(
-                !hints.iter().any(|hint| hint.starts_with("Ctrl+")),
-                "{hints:?}"
-            );
+            let other_ctrl_hint =
+                |hint: &String| hint.starts_with("Ctrl+") && hint != "Ctrl+Shift+N";
+            assert!(!hints.iter().any(other_ctrl_hint), "{hints:?}");
             assert!(
                 hints.iter().any(|hint| hint == "i"),
                 "the menu shows Strata's label, not GTK's rendering of the accelerator: {hints:?}"
             );
+            menu.popdown();
+            view.browser().clear_observer();
+            window.destroy();
+        },
+    );
+}
+
+#[test]
+fn context_hints_and_accelerators_follow_keymap_overrides() {
+    crate::test_support::gtk_test(
+        "ui::browser::context_menu::tests::menus::context_hints_and_accelerators_follow_keymap_overrides",
+        || {
+            use crate::ui::keys::{
+                Binding, Map,
+                bindings::{COPY_PATH, RENAME},
+            };
+            let manager = crate::ui::preferences::PreferenceManager::shared();
+            manager.set_tenxer_mode(false);
+            let fixture = tempfile::tempdir().expect("menu fixture");
+            let view = BrowserView::new(Rc::new(MenuSource), PeekBehavior::default());
+            view.set_operation_provider(Rc::new(crate::adapters::LocalOperationProvider));
+            let window = gtk::Window::builder()
+                .child(&view.widget())
+                .default_width(1000)
+                .default_height(850)
+                .build();
+            window.present();
+            view.browser()
+                .navigate(crate::model::Location::local(fixture.path()));
+            wait_until(|| label(&view.widget(), "notes.txt").is_some());
+            let menu = open_menu(&view, Some("notes.txt"));
+            let model = menu
+                .downcast_ref::<gtk::PopoverMenu>()
+                .and_then(gtk::PopoverMenu::menu_model)
+                .expect("native menu model");
+            let accelerator = || native_accelerator(&model, "Rename").expect("rename row");
+            let hint = || {
+                let hints = label_texts(&menu);
+                hints
+                    .iter()
+                    .position(|hint| hint == "Rename")
+                    .and_then(|index| hints.get(index + 1).cloned())
+            };
+            assert_eq!(hint().as_deref(), Some("F2 / Ctrl+R"));
+            assert_eq!(accelerator(), "F2");
+            manager.set_bindings(Map::Default, RENAME, vec![Binding::ctrl(gtk::gdk::Key::e)]);
+            assert_eq!(hint().as_deref(), Some("Ctrl+E"));
+            assert_eq!(accelerator(), "<Control>e");
+            manager.set_bindings(Map::Default, RENAME, Vec::new());
+            assert_ne!(hint().as_deref(), Some("Ctrl+E"));
+            assert_eq!(accelerator(), "");
+
+            // Type-to-search hides only a plain key it takes, not a key moved off one.
+            let copy_path = || {
+                let hints = label_texts(&menu);
+                hints
+                    .iter()
+                    .position(|hint| hint == "Copy path")
+                    .and_then(|index| hints.get(index + 1).cloned())
+            };
+            manager.set_type_to_search(true);
+            assert_ne!(copy_path().as_deref(), Some("y"));
+            manager.set_bindings(
+                Map::Default,
+                COPY_PATH,
+                vec![Binding::alt(gtk::gdk::Key::y)],
+            );
+            assert_eq!(copy_path().as_deref(), Some("Alt+Y"));
             menu.popdown();
             view.browser().clear_observer();
             window.destroy();
@@ -379,9 +449,9 @@ fn archive_extraction_actions_follow_build_support() {
 }
 
 #[test]
-fn remove_from_recent_is_gated_on_the_recent_location() {
+fn item_menu_rows_follow_the_location() {
     crate::test_support::gtk_test(
-        "ui::browser::context_menu::tests::menus::remove_from_recent_is_gated_on_the_recent_location",
+        "ui::browser::context_menu::tests::menus::item_menu_rows_follow_the_location",
         || {
             let fixture = tempfile::tempdir().expect("menu fixture");
             let view = BrowserView::new(Rc::new(MenuSource), PeekBehavior::default());
@@ -392,31 +462,28 @@ fn remove_from_recent_is_gated_on_the_recent_location() {
                 .build();
             window.present();
 
-            view.browser().navigate(Location::local(fixture.path()));
-            wait_until(|| label(&view.widget(), "notes.txt").is_some());
-            let menu = open_menu(&view, Some("notes.txt"));
-            assert!(
-                !label_texts(&menu)
-                    .iter()
-                    .any(|text| text == "Remove from Recent"),
-                "{:?}",
-                label_texts(&menu)
-            );
-            menu.popdown();
-            wait_until(|| !menu.is_mapped());
-
-            view.browser().navigate(Location::uri("recent:///"));
-            wait_until(|| label(&view.widget(), "notes.txt").is_some());
-            let menu = open_menu(&view, Some("notes.txt"));
-            let labels = label_texts(&menu);
-            assert!(
-                labels.iter().any(|text| text == "Remove from Recent"),
-                "{labels:?}"
-            );
-            assert!(labels.iter().any(|text| text == "Open"), "{labels:?}");
-            assert!(labels.iter().any(|text| text == "Copy"), "{labels:?}");
-            menu.popdown();
-            wait_until(|| !menu.is_mapped());
+            for (location, can_create, in_recent) in [
+                (Location::local(fixture.path()), true, false),
+                (Location::uri("recent:///"), false, true),
+                (Location::uri("trash:///"), false, false),
+                (Location::local(fixture.path()), true, false),
+            ] {
+                view.browser().navigate(location.clone());
+                wait_until(|| label(&view.widget(), "notes.txt").is_some());
+                let menu = open_menu(&view, Some("notes.txt"));
+                let labels = label_texts(&menu);
+                let has = |row: &str| labels.iter().any(|text| text == row);
+                assert_eq!(has("New Folder"), can_create, "{location:?}: {labels:?}");
+                assert_eq!(has("New File"), can_create, "{location:?}: {labels:?}");
+                assert_eq!(
+                    has("Remove from Recent"),
+                    in_recent,
+                    "{location:?}: {labels:?}"
+                );
+                assert!(has("Open") && has("Copy"), "{location:?}: {labels:?}");
+                menu.popdown();
+                wait_until(|| !menu.is_mapped());
+            }
 
             view.browser().clear_observer();
             window.destroy();
@@ -562,6 +629,24 @@ fn tree_label_texts(menu: &gtk::Popover) -> Vec<String> {
         .filter(|label| !label.text().is_empty())
         .map(|label| label.text().to_string())
         .collect()
+}
+
+/// The `accel` attribute of the native row labeled `label`, empty without one.
+fn native_accelerator(model: &gio::MenuModel, label: &str) -> Option<String> {
+    (0..model.n_items()).find_map(|index| {
+        let attribute = |name| {
+            model
+                .item_attribute_value(index, name, None)
+                .and_then(|value| value.get::<String>())
+        };
+        if attribute("label").as_deref() == Some(label) {
+            return Some(attribute("accel").unwrap_or_default());
+        }
+        ["section", "submenu"]
+            .into_iter()
+            .filter_map(|link| model.item_link(index, link))
+            .find_map(|linked| native_accelerator(&linked, label))
+    })
 }
 
 fn label_texts(menu: &gtk::Popover) -> Vec<String> {

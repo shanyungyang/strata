@@ -2,7 +2,7 @@
 
 Strata can serve the XDG Desktop Portal FileChooser interface for portal-aware applications. Native file pickers and applications that do not use the portal are unchanged.
 
-The chooser is deliberately limited to local files and folders. It uses the main app's sidebar, Columns/Icons/List views, List type grouping, filters, metadata, previews, and themed controls. Recent appears when enabled in sidebar preferences and supported by the desktop's recent-files backend; only local targets are listed. Overwrite confirmation uses the same in-window modal as the app.
+The chooser is deliberately limited to local files and folders. It uses the main app's sidebar, Columns/Icons/List views, List type grouping, filters, metadata, previews, and themed controls. Recent appears when enabled in sidebar preferences and supported by the desktop's recent-files backend; only local targets are listed. Overwrite confirmation uses the same in-window modal as the app and names only the files that already exist.
 
 The picker and browser share the sidebar's compact rows, insertion gaps, drag
 feedback, and place/pin reordering. Local folders dragged into a Pinned gap are
@@ -108,7 +108,7 @@ This installs the portal metadata and D-Bus activation service below `$XDG_DATA_
 
 The chooser backend is activated on demand and exits after about two minutes without an active request (checked every 10 seconds). An open dialog (including a pending request) keeps it running; closing the last dialog starts the idle countdown again. In-app updates stop old Strata windows and chooser backends, then automatically relaunch the updating window with the replacement binary. External package-manager updates and manual binary replacements do not invoke the in-app retirement step; restart remaining Strata processes or log out after those updates.
 
-The generated D-Bus service contains the absolute path of the command being run. Move Strata to its permanent location before installing the portal. For safe activation, every component of the canonical executable path must be owned by the current user or root and must not be writable by other users. D-Bus service-file argument parsing is not shell quoting, so the installer also rejects executable paths containing whitespace, quotes, or backslashes.
+The generated D-Bus service contains the absolute path of the command being run. Move Strata to its permanent location before installing the portal. For safe activation, every component of the canonical executable path must be owned by the current user or root and must not be writable by other users. Group write access is accepted only on a group nobody but the current user belongs to, such as the private group most distributions give each user. D-Bus service-file argument parsing is not shell quoting, so the installer also rejects executable paths containing whitespace, quotes, or backslashes.
 
 ### Manual installation
 

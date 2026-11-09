@@ -18,15 +18,15 @@ user-defined names, or the locale environment inherited by other programs.
   shared with the standalone Bash installer. After editing, regenerate its
   embedded catalog with `python3 scripts/installer_messages.py --write`.
 
-Locales are `en`, `fr`, `de`, `es`, `ja`, `pt-BR`, `ko`, `vi`, `it`, `ru`,
+Locales are `en`, `fr`, `hu`, `de`, `es`, `ja`, `pt-BR`, `ko`, `vi`, `it`, `ru`,
 `zh-CN`, and `zh-TW`.
 JSON keys normally contain the original English message. Semantic keys are used
 for grammatical count forms and calendar data, and for an English word that needs
 a different translation in one context. Those context keys are prefixed with their
 use and their English value is the plain word: `completion.complete`,
 `chooser.filter`, `permissions.group`, `archive.format`, `properties.pinned`,
-`release_channel.preview`, `build_kind.nightly`, `pasted_image.name`, and
-`action_icon.*`.
+`release_channel.preview`, `build_kind.nightly`, `pasted_image.name`,
+`dropped_text.name`, and `action_icon.*`.
 `settings_keywords.<target id>` keys hold space-separated search synonyms for a
 Settings search target; their English value is the English alias list. All catalogs
 are build inputs: `build.rs` embeds them as static tables served by the
@@ -35,6 +35,8 @@ The installer embeds its messages from the same rust-i18n source catalog so it
 needs no translation files, Python, or installed Strata binary at runtime. It
 uses the system locale with the same `LANGUAGE` and POSIX precedence rules as the
 application; the saved application language does not affect installation.
+The `--install-udiskie-unlock` and `--uninstall-udiskie-unlock` command-line
+modes, whose output the installer shows, print in the same system locale.
 
 Do not point `i18n!` at `data/locales`; its per-message initializer needs megabytes of
 stack in unoptimized builds and overflows worker and test threads.
@@ -124,7 +126,13 @@ rustix errnos converted with `.into()`) or `services::gio_error_message`
 shows a generic translated reason and logs the system text; an `io::Error` built
 with its own message keeps that message, except a `storage::DestinationError`
 (an atomic write that refused its destination), which is shown through its
-localized `message()`, and `gio_error_message` falls back to GIO's text. Never format an `io::Error` directly: its `Display` adds an
+localized `message()`. `gio_error_message` preserves application-owned detail for
+unclassified errors. Network-location validation, directory enumeration, and mount
+failures use `services::gio_backend_error_message`, which shares the same typed
+reasons, reads untyped backend text that describes refused credentials as
+"Permission denied", substitutes a generic translated reason for other unknown
+backend text, and retains sanitized detail in diagnostic logs.
+Never format an `io::Error` directly: its `Display` adds an
 `(os error N)` suffix and can name internal temporary paths. These return
 standalone, capitalized text. When the
 reason continues a sentence after a colon, as the `%{error}` value of a template
@@ -170,8 +178,10 @@ catalog, so translators place the key text but never write it (see
 before any particle that follows the placeholder (`%{keys} 키를`), because the
 particle cannot follow how the key is read.
 
-External release notes, system/GIO descriptions, uncommon system errors, and
-toolkit-owned controls may follow their provider or system language. Do not
+External release notes, provider-owned authentication prompts, native-volume terminal
+diagnostics, and toolkit-owned controls may follow their provider or system language.
+Unclassified failures at these network-location boundaries use Strata's translated
+fallback rather than echoing backend wording. Do not
 rewrite the process environment to translate them: spawned commands must retain
 the user's locale. Translations should be reviewed by native speakers, particularly longer
 help text and destructive-operation confirmations.
@@ -223,7 +233,9 @@ Run targeted regressions using the private display/session bus:
 ```
 
 Catalog tests require every supported locale to contain the same source keys
-and preserve interpolation placeholders. Behavioral tests cover saved startup
+and preserve interpolation placeholders. They cannot see a source string that
+was never added to a catalog, so a Settings test builds every page and requires
+each section heading to have an entry in every catalog. Behavioral tests cover saved startup
 language, restart-only application, synchronized Settings controls, restart
 close guards, plural rules, literal user data, and app-language calendar labels.
 For broad code changes, also follow the full validation policy in `AGENTS.md`.

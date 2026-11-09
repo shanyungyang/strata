@@ -11,12 +11,10 @@ pub(super) fn stepper(labels: [String; 3]) -> (gtk::Box, [gtk::Button; 3]) {
     control.set_hexpand(true);
     control.set_halign(gtk::Align::End);
     let buttons = std::array::from_fn(|index| {
-        let label = &labels[index];
         let button = gtk::Button::new();
         if index == 1 {
             button.add_css_class("appearance-text-value");
             button.set_hexpand(true);
-            super::accessibility::set_description(&button, Some(label));
         } else {
             let icon = if index == 0 {
                 crate::assets::icons::MINUS
@@ -28,13 +26,23 @@ pub(super) fn stepper(labels: [String; 3]) -> (gtk::Box, [gtk::Button; 3]) {
             image.set_valign(gtk::Align::Center);
             button.set_child(Some(&image));
             button.add_css_class("appearance-text-step");
-            super::accessibility::set_label(&button, label);
-            button.set_tooltip_text(Some(label));
         }
+        label_stepper_button(&button, &labels[index]);
         control.append(&button);
         button
     });
     (control, buttons)
+}
+
+/// The value button keeps its text and takes `label` as its description; the
+/// icon-only step buttons take it as their name and tooltip.
+pub(super) fn label_stepper_button(button: &gtk::Button, label: &str) {
+    if button.has_css_class("appearance-text-value") {
+        super::accessibility::set_description(button, Some(label));
+    } else {
+        super::accessibility::set_label(button, label);
+        button.set_tooltip_text(Some(label));
+    }
 }
 
 /// A numeric stepper with GTK's native spin actions, decrement before the entry.
@@ -357,6 +365,20 @@ const MENU_OPTION_CLASS: &str = "column-menu-option";
 pub(super) fn menu_action(label: &str) -> gtk::Button {
     let action = super::accessibility::menu_item_button();
     action.set_child(Some(&menu_option_label(label)));
+    action.add_css_class(MENU_OPTION_CLASS);
+    action
+}
+
+/// A menu action whose label sits above a dimmed detail line, such as a path.
+pub(super) fn menu_action_with_detail(label: &str, detail: &str) -> gtk::Button {
+    let column = gtk::Box::new(gtk::Orientation::Vertical, 1);
+    column.append(&menu_option_label(label));
+    let detail_label = menu_option_label(detail);
+    detail_label.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+    detail_label.add_css_class("menu-option-detail");
+    column.append(&detail_label);
+    let action = super::accessibility::menu_item_button();
+    action.set_child(Some(&column));
     action.add_css_class(MENU_OPTION_CLASS);
     action
 }

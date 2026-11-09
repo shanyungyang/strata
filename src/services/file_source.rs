@@ -54,6 +54,9 @@ pub enum LocationValidationError {
     /// A chooser policy refusal, held as an English source message.
     Refused(&'static str),
     EmbeddedCredential,
+    /// Polkit refused an `admin://` operation, or its prompt was dismissed; GVfs reports both
+    /// as `PERMISSION_DENIED`.
+    NotAuthorized,
     /// Already localized by [`backend_unavailable_message`].
     BackendUnavailable(String),
 }
@@ -91,12 +94,13 @@ impl fmt::Display for LocationValidationError {
             Self::UnsupportedScheme(scheme) => write!(
                 formatter,
                 "The {scheme}:// scheme isn't supported. Use an absolute local path or one of: \
-                 smb://, sftp://, ftp://, ftps://, dav://, davs://, or recent:///."
+                 smb://, sftp://, ftp://, ftps://, dav://, davs://, admin://, or recent:///."
             ),
             Self::EmbeddedCredential => formatter.write_str(
                 "Passwords typed into the address bar aren't accepted. Enter the address \
                  without a password, you'll be prompted to sign in securely.",
             ),
+            Self::NotAuthorized => formatter.write_str("Administrator access wasn't granted."),
             Self::BackendUnavailable(message) => formatter.write_str(message),
         }
     }
@@ -122,13 +126,14 @@ impl LocationValidationError {
             .into_owned(),
             Self::UnsupportedShorthand(message) | Self::Refused(message) => tr(message),
             Self::UnsupportedScheme(scheme) => rust_i18n::t!(
-                "The %{scheme}:// scheme isn't supported. Use an absolute local path or one of: smb://, sftp://, ftp://, ftps://, dav://, davs://, or recent:///.",
+                "The %{scheme}:// scheme isn't supported. Use an absolute local path or one of: smb://, sftp://, ftp://, ftps://, dav://, davs://, admin://, or recent:///.",
                 scheme = scheme
             )
             .into_owned(),
             Self::EmbeddedCredential => tr(
                 "Passwords typed into the address bar aren't accepted. Enter the address without a password, you'll be prompted to sign in securely.",
             ),
+            Self::NotAuthorized => tr("Administrator access wasn't granted."),
             Self::BackendUnavailable(message) => message.clone(),
         }
     }
@@ -196,6 +201,7 @@ pub(crate) fn io_error_reason(error: &std::io::Error) -> Option<&'static str> {
         ErrorKind::NotConnected => "The location is no longer connected",
         ErrorKind::StaleNetworkFileHandle => "The network file handle is no longer valid",
         ErrorKind::ExecutableFileBusy => "The file is running and cannot be changed",
+        ErrorKind::CrossesDevices => "The destination is on a different file system",
         _ => return None,
     })
 }
@@ -215,10 +221,47 @@ pub(crate) fn system_error_text(error: &std::io::Error) -> String {
     }
 }
 
-/// Localized text for common GIO failures; other errors keep GIO's description.
+/// Localized common GIO failures; application-owned errors retain their detail.
 pub(crate) fn gio_error_message(error: &glib::Error) -> String {
+    gio_error_reason(error)
+        .map(crate::i18n::tr)
+        .unwrap_or_else(|| error.message().to_owned())
+}
+
+/// Platform backend wording is diagnostic detail, not an application-owned message.
+pub(crate) fn gio_backend_error_message(error: &glib::Error) -> String {
+    let reason = gio_error_reason(error)
+        .or_else(|| describes_refused_credentials(error.message()).then_some("Permission denied"))
+        .unwrap_or_else(|| {
+            tracing::debug!(
+                error = %sanitize_failure_message(error.message()),
+                "unrecognized GIO backend error"
+            );
+            UNEXPECTED_SYSTEM_ERROR
+        });
+    crate::i18n::tr(reason)
+}
+
+/// GVfs' SMB backend reports rejected credentials as `G_IO_ERROR_FAILED` on
+/// some versions, preserving the distinction only in its message.
+pub(crate) fn describes_refused_credentials(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    [
+        "permission denied",
+        "authentication failed",
+        "authentication required",
+        "auth fail",
+        "too many authentication failures",
+        "logon failure",
+        "invalid credentials",
+    ]
+    .iter()
+    .any(|reason| message.contains(reason))
+}
+
+fn gio_error_reason(error: &glib::Error) -> Option<&'static str> {
     use gtk::gio::IOErrorEnum;
-    let message = match error.kind::<IOErrorEnum>() {
+    Some(match error.kind::<IOErrorEnum>() {
         Some(IOErrorEnum::NotFound) => "No such file or folder",
         Some(IOErrorEnum::PermissionDenied) => "Permission denied",
         Some(IOErrorEnum::NotDirectory) => "Not a folder",
@@ -237,9 +280,8 @@ pub(crate) fn gio_error_message(error: &glib::Error) -> String {
         Some(IOErrorEnum::HostNotFound) => "Could not find the server",
         Some(IOErrorEnum::TooManyLinks) => "There are too many levels of symbolic links",
         Some(IOErrorEnum::NotMounted) => "The location is not mounted",
-        _ => return error.message().to_owned(),
-    };
-    crate::i18n::tr(message)
+        _ => return None,
+    })
 }
 
 /// [`gio_error_message`] for the `%{error}` slot after a colon; see [`error_detail`].
@@ -248,14 +290,14 @@ pub(crate) fn gio_error_detail(error: &glib::Error) -> String {
 }
 
 /// Adapts a standalone, capitalized error reason for a `…: %{error}` slot. French, Spanish,
-/// Italian, Portuguese, Russian and Vietnamese continue in lower case after a colon; German
-/// capitalizes nouns, and English and CJK keep the text as is.
+/// Italian, Portuguese, Hungarian, Russian and Vietnamese continue in lower case after a colon;
+/// German capitalizes nouns, and English and CJK keep the text as is.
 pub(crate) fn error_detail(text: String) -> String {
     error_detail_in(&rust_i18n::locale(), text)
 }
 
 fn error_detail_in(locale: &str, text: String) -> String {
-    if !matches!(locale, "fr" | "es" | "it" | "pt-BR" | "ru" | "vi") {
+    if !matches!(locale, "fr" | "es" | "it" | "pt-BR" | "hu" | "ru" | "vi") {
         return text;
     }
     let mut chars = text.chars();
@@ -302,15 +344,49 @@ pub struct UriCredentials {
     pub password: String,
 }
 
+/// Host text (authority minus user-info and port) of a `scheme://` URI, verbatim.
+fn host_text(uri: &str) -> Option<&str> {
+    let rest = &uri[uri.find("://")? + 3..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+    let hostport = authority.rsplit('@').next().unwrap_or(authority);
+    if hostport.is_empty() {
+        return None;
+    }
+    if let Some(bracketed) = hostport.strip_prefix('[') {
+        let end = bracketed.find(']')?;
+        Some(&hostport[..end + 2])
+    } else {
+        Some(hostport.split(':').next().filter(|host| !host.is_empty())?)
+    }
+}
+
+/// Like `Uri::to_str`, but the host keeps the input's original spelling.
+/// GUri IDNA-encodes non-ASCII hosts on re-serialization, which turns gvfs
+/// device URIs (mtp device names may contain CJK) into `xn--` names that the
+/// gvfs backend cannot resolve.
+fn to_str_preserving_host(input: &str, uri: &glib::Uri) -> String {
+    let normalized = uri.to_str().to_string();
+    match (host_text(input), host_text(&normalized)) {
+        (Some(raw_host), Some(norm_host)) if !raw_host.is_empty() && !norm_host.is_empty() => {
+            normalized.replacen(norm_host, raw_host, 1)
+        }
+        _ => normalized,
+    }
+}
+
 /// Removes URI user-info secrets while preserving the username separately.
 /// Path, query and fragment keep GIO's percent-encoding so non-UTF-8 names survive.
+/// The host is preserved verbatim from `input`: GUri re-serialization IDNA-encodes
+/// non-ASCII hosts (`mtp://OnePlus_一加_...` becomes `mtp://xn--...`), which gvfs
+/// backends cannot match to their device names (the location then never resolves).
 pub fn sanitize_uri_credentials(
     input: &str,
 ) -> Result<(String, Option<UriCredentials>), LocationValidationError> {
     let uri = glib::Uri::parse(input, GIO_URI_PARSE_FLAGS)
         .map_err(|_| LocationValidationError::InvalidUri)?;
     if !uri_contains_credentials(&uri) {
-        return Ok((uri.to_str().to_string(), None));
+        return Ok((to_str_preserving_host(input, &uri), None));
     }
 
     let mut username = uri.user().map(|user| user.to_string()).unwrap_or_default();
@@ -336,7 +412,7 @@ pub fn sanitize_uri_credentials(
             .map(str::to_owned);
     }
 
-    let sanitized = glib::Uri::build_with_user(
+    let rebuilt = glib::Uri::build_with_user(
         GIO_URI_BUILD_FLAGS,
         &uri.scheme(),
         (!username.is_empty()).then_some(username.as_str()),
@@ -347,9 +423,8 @@ pub fn sanitize_uri_credentials(
         &uri.path(),
         uri.query().as_deref(),
         uri.fragment().as_deref(),
-    )
-    .to_str()
-    .to_string();
+    );
+    let sanitized = to_str_preserving_host(input, &rebuilt);
     let credentials = UriCredentials {
         username,
         password: password.unwrap_or_default(),
@@ -514,6 +589,8 @@ pub enum DirectoryEvent {
         request_id: RequestId,
         message: String,
         refused: bool,
+        /// Permissions keep the user out of a native folder that exists.
+        denied: bool,
     },
     /// Size/mtime arrivals for already-listed entries, positioned by the receiver
     /// against stable locations. Zero or more chunks, then exactly one `MetadataFinished`
@@ -553,10 +630,20 @@ pub struct MetadataUpdate {
     pub location: Location,
     pub size: MetadataValue<u64>,
     pub modified_unix_seconds: MetadataValue<i64>,
+    pub created_unix_seconds: MetadataValue<i64>,
     pub mode: MetadataValue<u32>,
     pub image_dimensions: MetadataValue<(u32, u32)>,
     pub child_count: MetadataValue<u64>,
     pub duration_seconds: MetadataValue<u64>,
+    pub listable: MetadataValue<bool>,
+}
+
+#[derive(Clone, Debug)]
+pub struct WatchRequest {
+    pub location: Location,
+    pub include_hidden: bool,
+    /// The folder's identity from the load that asked for the watch.
+    pub began_on: Option<ItemIdentity>,
 }
 
 #[derive(Clone, Debug)]
@@ -609,6 +696,11 @@ pub trait FileSource {
         None
     }
 
+    /// Whether a native folder the user can't read may be reopened through `admin://`.
+    fn offers_administrator_access(&self) -> bool {
+        false
+    }
+
     fn validate_location(&self, location: &Location) -> Result<(), LocationValidationError>;
 
     /// Validates a location without blocking the caller. Providers should override this when
@@ -653,12 +745,11 @@ pub trait FileSource {
 
     fn start_watch(
         &self,
-        location: Location,
-        include_hidden: bool,
+        request: WatchRequest,
         notify: Rc<dyn Fn(DirectoryChange)>,
         report: Rc<dyn Fn(Watching)>,
     ) -> LoadHandle {
-        match self.watch(location, include_hidden, notify) {
+        match self.watch(request.location, request.include_hidden, notify) {
             Some(watch) => {
                 report(Watching::Live);
                 watch
@@ -695,11 +786,13 @@ pub trait FileSource {
         LoadHandle::new(|| {})
     }
 
-    /// Finds the folder in `parent` that matches `identity`, such as one renamed in place.
-    /// Emits `None` when nothing matches or `parent` cannot be listed.
+    /// Finds where the folder last seen at `departed` went by its `identity`: renamed in
+    /// place, or carried along by an ancestor renamed in place. Only the nearest existing
+    /// ancestor of `departed` is searched. Emits `None` when nothing matches or that
+    /// ancestor cannot be listed.
     fn find_by_identity(
         &self,
-        _parent: Location,
+        _departed: Location,
         _identity: ItemIdentity,
         emit: Rc<dyn Fn(Option<Location>)>,
     ) -> LoadHandle {

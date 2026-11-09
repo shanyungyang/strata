@@ -3,9 +3,10 @@
 use super::{
     ArchiveDirectory, ArchiveFileEntry, ArchiveNode, MediaPreviewSize, PreviewContent,
     archive_preview_format, archive_preview_tree, bytes_support_named_family, content_family,
-    has_plain_text_extension, is_extensionless_dotfile, is_image_path, is_media_path,
-    is_non_executable_extensionless_dotfile, looks_like_text, normalize_preview_text,
-    reconcile_with_sample,
+    guess_content_type, has_plain_text_extension, is_extensionless_dotfile, is_image_path,
+    is_media_path, is_non_executable_extensionless_dotfile, is_raw_video_stream, looks_like_text,
+    normalize_preview_text, read_supports_named_family, reconcile_with_sample,
+    refine_reported_content_type,
 };
 
 #[test]
@@ -39,7 +40,45 @@ fn recognizes_image_paths_for_metadata_probes() {
     assert!(!is_image_path(std::path::Path::new("notes.txt")));
     assert!(is_media_path(std::path::Path::new("movie.mp4")));
     assert!(is_media_path(std::path::Path::new("song.flac")));
-    assert!(!is_media_path(std::path::Path::new("photo.png")));
+    for (name, expected) in [
+        ("stream.h264", "video/h264"),
+        ("STREAM.H264", "video/h264"),
+        ("stream.264", "video/h264"),
+        ("stream.h265", "video/h265"),
+        ("stream.265", "video/h265"),
+        ("stream.HEVC", "video/h265"),
+    ] {
+        assert!(is_media_path(std::path::Path::new(name)), "{name}");
+        assert_eq!(guess_content_type(std::path::Path::new(name)).0, expected);
+        assert!(is_raw_video_stream(expected), "{expected}");
+    }
+    for content_type in ["video/mp4", "image/gif", "video/x-matroska"] {
+        assert!(!is_raw_video_stream(content_type), "{content_type}");
+    }
+    for name in ["photo.png", "stream.h264.txt", "stream.hevc.backup"] {
+        assert!(!is_media_path(std::path::Path::new(name)), "{name}");
+    }
+}
+
+#[test]
+fn binary_sniffs_defer_to_the_name_and_byte_backed_types_win() {
+    for (reported, name, expected) in [
+        ("application/octet-stream", "clip.hevc", "video/h265"),
+        ("application/octet-stream", "clip.264", "video/h264"),
+        (
+            "application/octet-stream",
+            "blob.bin",
+            "application/octet-stream",
+        ),
+        ("text/plain", "notes.h264", "text/plain"),
+        ("video/mp4", "clip.h264", "video/mp4"),
+    ] {
+        assert_eq!(
+            refine_reported_content_type(reported, std::path::Path::new(name)),
+            expected,
+            "{reported} {name}"
+        );
+    }
 }
 
 #[test]
@@ -625,11 +664,13 @@ fn password_request(password: Option<&str>) -> super::PreviewRequest {
             kind: EntryKind::File,
             size: MetadataValue::Unknown,
             modified_unix_seconds: MetadataValue::Unknown,
+            created_unix_seconds: MetadataValue::Unknown,
             mode: MetadataValue::Unknown,
             recent_unix_seconds: MetadataValue::Unknown,
             image_dimensions: MetadataValue::Unknown,
             child_count: MetadataValue::Unknown,
             duration_seconds: MetadataValue::Unknown,
+            listable: MetadataValue::Unknown,
             is_hidden: false,
             recent_uri: None,
         },
@@ -709,10 +750,7 @@ fn text_detection_follows_bytes_not_names() {
 }
 
 fn named_family(name: &str) -> (String, PreviewContent) {
-    let content_type =
-        gtk::gio::content_type_guess(Some(std::path::Path::new(name)), None::<&[u8]>)
-            .0
-            .to_string();
+    let content_type = super::guess_content_type(std::path::Path::new(name)).0;
     let mut content = content_family(&content_type);
     if matches!(content, PreviewContent::Unsupported)
         && gtk::gio::content_type_is_a(&content_type, "text/plain")
@@ -747,6 +785,8 @@ fn preview_family_follows_bytes_when_names_disagree() {
     for (name, bytes, expected) in [
         ("notes.png", &b"just some notes\n"[..], "text"),
         ("clip.mp4", &b"not a movie\n"[..], "text"),
+        ("clip.h264", &b"not a movie\n"[..], "text"),
+        ("EMPTY.H264", &b""[..], "text"),
         ("backup.zip", &b"not an archive\n"[..], "text"),
         ("app.ts", &b"const x: number = 42;\n"[..], "text"),
         ("App.tsx", &b"export const C = () => <div />;\n"[..], "text"),
@@ -805,6 +845,7 @@ fn metadata_probes_skip_text_that_merely_shares_a_media_name() {
     for (name, bytes, supported) in [
         ("clip.mp4", &b"export const x = 1;\n"[..], false),
         ("clip.ts", &b"export const x = 1;\n"[..], false),
+        ("clip.h264", &b"export const x = 1;\n"[..], false),
         ("photo.png", &b"not pixels\n"[..], false),
         ("photo.png", &png[..], true),
         (
@@ -821,5 +862,10 @@ fn metadata_probes_skip_text_that_merely_shares_a_media_name() {
             std::fs::write(&path, bytes).expect("fixture");
         }
         assert_eq!(bytes_support_named_family(&path), supported, "{name}");
+        assert_eq!(
+            read_supports_named_family(&path).ok(),
+            (name != "missing.mp4").then_some(supported),
+            "{name}: a failed read is no answer"
+        );
     }
 }

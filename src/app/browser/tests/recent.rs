@@ -10,6 +10,7 @@ fn recent_entry(name: &str, kind: EntryKind, recent: i64, modified: i64) -> File
         kind,
         recent_unix_seconds: MetadataValue::Known(recent),
         modified_unix_seconds: MetadataValue::Known(modified),
+        created_unix_seconds: MetadataValue::Unknown,
         ..batch_entry(name)
     }
 }
@@ -245,6 +246,7 @@ fn recent_sort_changes_stay_local_and_normal_folder_defaults_are_preserved() {
             .expect("Recent preferences")
             .folders_first
     );
+    assert!(!browser.toggle_folders_first(0));
 
     assert_eq!(browser.preferences(), defaults);
     assert!(observed.borrow().is_empty());

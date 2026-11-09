@@ -13,9 +13,10 @@ use gtk::{
 use super::{Dispatcher, KeyResult};
 use crate::{
     model::{Location, SortDirection, SortKey},
+    services::InvocationSource,
     ui::{
         browser::{ConflictFocus, Yank},
-        keys::{KeyPress, bindings::*},
+        keys::{Binding, Command, Digits, KeyPress, bindings::*},
         tenxer_mode::{Chord, Prompt},
         window::visible_modal_layer,
     },
@@ -41,26 +42,41 @@ pub(super) struct ArmedActions {
     ids: Vec<String>,
 }
 
+/// Shift with a step reverses it, on whatever key the step is bound to. A key
+/// bound to a step itself wins over another step's reversed key.
 fn sort_choice(press: &KeyPress) -> Option<(SortKey, SortDirection)> {
-    use SortDirection::{Ascending, Descending};
-    [
-        (SORT_BY_NAME, (SortKey::Name, Ascending)),
-        (SORT_BY_NAME_REVERSED, (SortKey::Name, Descending)),
-        (SORT_BY_MODIFIED, (SortKey::Modified, Ascending)),
-        (SORT_BY_MODIFIED_REVERSED, (SortKey::Modified, Descending)),
-        (SORT_BY_SIZE, (SortKey::Size, Ascending)),
-        (SORT_BY_SIZE_REVERSED, (SortKey::Size, Descending)),
-        (SORT_BY_TYPE, (SortKey::Type, Ascending)),
-        (SORT_BY_TYPE_REVERSED, (SortKey::Type, Descending)),
-    ]
-    .into_iter()
-    .find(|(binding, _)| press.is(*binding))
-    .map(|(_, choice)| choice)
+    const STEPS: [(Command, SortKey); 7] = [
+        (SORT_BY_NAME, SortKey::Name),
+        (SORT_BY_MODIFIED, SortKey::Modified),
+        (SORT_BY_SIZE, SortKey::Size),
+        (SORT_BY_TYPE, SortKey::Type),
+        (SORT_BY_EXTENSION, SortKey::Extension),
+        (SORT_BY_CREATED, SortKey::Created),
+        (SORT_BY_UNSORTED, SortKey::Unsorted),
+    ];
+    let reversed = |step: Command| {
+        step.bindings().into_iter().any(|binding| {
+            press.is(Binding::new(
+                binding.key(),
+                binding.modifiers() | gtk::gdk::ModifierType::SHIFT_MASK,
+            ))
+        })
+    };
+    STEPS
+        .into_iter()
+        .find(|(step, _)| press.is(*step))
+        .map(|(_, sort_key)| (sort_key, SortDirection::Ascending))
+        .or_else(|| {
+            STEPS
+                .into_iter()
+                .find(|(step, _)| reversed(*step))
+                .map(|(_, sort_key)| (sort_key, SortDirection::Descending))
+        })
 }
 
 /// 0 is slot 10.
-fn action_slot(press: &KeyPress) -> Option<(u8, usize)> {
-    let digit = press.digit_in(ACTIONS_NUMBERS)?;
+fn action_slot(press: &KeyPress, digits: Digits) -> Option<(u8, usize)> {
+    let digit = press.digit_in(digits)?;
     let slot = if digit == 0 { 10 } else { usize::from(digit) };
     Some((digit, slot))
 }
@@ -76,25 +92,29 @@ impl Dispatcher {
             return None;
         }
         // Result navigation also consumes Ctrl+H; toggling must win.
-        if press.is_any(&[HIDDEN_FILES, HIDDEN_FILES_PERIOD, TENXER_HIDDEN_FILES]) {
+        if press.is(HIDDEN_FILES) {
             self.view.toggle_hidden_from_keys();
+        } else if press.is(BOOKMARK_SET) {
+            self.shortcuts.arm_chord(Chord::BookmarkSet);
+        } else if press.is(BOOKMARK_GO) {
+            self.arm_bookmark_go();
         } else if press.is(SORT_BY) {
             self.shortcuts.arm_chord(Chord::Sort);
         } else if press.is(ACTIONS) {
-            self.arm_actions();
-        } else if press.is_any(&[TENXER_RENAME, RENAME]) {
+            self.arm_actions(InvocationSource::Selection);
+        } else if press.is(RENAME) {
             self.open_rename_prompt();
         } else if press.is(OPEN_WITH) {
             self.open_with_targets();
-        } else if press.is_any(&[DELETE, TENXER_DELETE]) {
+        } else if press.is(MOVE_TO_TRASH) {
             self.delete_targets(false);
-        } else if press.is_any(&[DELETE_PERMANENTLY, TENXER_DELETE_PERMANENTLY]) {
+        } else if press.is(DELETE_PERMANENTLY) {
             self.delete_targets(true);
         } else if press.is(YANK) {
             self.yank(false);
         } else if press.is(YANK_CUT) {
             self.yank(true);
-        } else if press.is_any(&[UNYANK, UNYANK_X]) {
+        } else if press.is(UNYANK) {
             self.view.unyank();
         } else if press.is(PASTE_KEEP_BOTH) {
             self.paste(ConflictFocus::KeepBoth);
@@ -176,7 +196,7 @@ impl Dispatcher {
         self.rename_target.replace(Some(entry));
     }
 
-    fn open_transfer_prompt(&self, kind: Prompt) {
+    pub(super) fn open_transfer_prompt(&self, kind: Prompt) {
         match self.view.transfer_targets(kind == Prompt::MoveTo) {
             Ok(targets) => self.open_destination_prompt(kind, targets),
             Err(reason) => self.shortcuts.show_feedback(&crate::i18n::tr(reason)),
@@ -189,7 +209,7 @@ impl Dispatcher {
         }
     }
 
-    fn restore_targets(&self) {
+    pub(super) fn restore_targets(&self) {
         use crate::ui::browser::TargetCommand;
         match self.view.restore_targets() {
             TargetCommand::Nothing => self
@@ -229,6 +249,20 @@ impl Dispatcher {
 
 impl Dispatcher {
     pub(super) fn complete_sort(&self, press: &KeyPress) -> bool {
+        if press.is(SORT_BY_FOLDERS_FIRST) {
+            self.view.toggle_focused_folders_first();
+            return true;
+        }
+        if press.is(SORT_BY_NATURAL)
+            || press.is(SORT_BY_ALPHABETICAL)
+            || press.is(SORT_BY_CASE_SENSITIVE)
+        {
+            self.view.change_focused_name_comparison(
+                press.is(SORT_BY_CASE_SENSITIVE),
+                press.is(SORT_BY_NATURAL),
+            );
+            return true;
+        }
         let Some((sort_key, direction)) = sort_choice(press) else {
             return false;
         };
@@ -236,15 +270,15 @@ impl Dispatcher {
         true
     }
 
-    fn arm_actions(&self) {
+    fn arm_actions(&self, source: InvocationSource) {
         use crate::ui::keys::{
             self, Keys,
             bindings::{
-                ACTIONS_COMPRESS, ACTIONS_EXTRACT, ACTIONS_EXTRACT_TO, ACTIONS_NUMBERS,
-                ACTIONS_TERMINAL,
+                ACTIONS_COMPRESS, ACTIONS_EXTRACT, ACTIONS_EXTRACT_TO, ACTIONS_FOLDER,
+                ACTIONS_NUMBERS, ACTIONS_TERMINAL,
             },
         };
-        let numbered = self.view.numbered_actions();
+        let numbered = self.view.numbered_actions(source);
         let mut rows = if numbered.actions.is_empty() {
             vec![(
                 keys::label(&Keys::Digits(ACTIONS_NUMBERS.step())),
@@ -258,15 +292,27 @@ impl Dispatcher {
                 .map(|(index, action)| (slot_key(index), action.name().to_owned()))
                 .collect()
         };
-        rows.extend(
-            [
-                (ACTIONS_TERMINAL, "Open terminal here"),
-                (ACTIONS_COMPRESS, "Compress\u{2026}"),
-                (ACTIONS_EXTRACT, "Extract here"),
-                (ACTIONS_EXTRACT_TO, "Extract to\u{2026}"),
-            ]
-            .map(|(step, action)| (keys::label(&Keys::One(step)), crate::i18n::tr(action))),
-        );
+        let chord = match source {
+            InvocationSource::Selection => {
+                rows.extend(
+                    [
+                        (ACTIONS_FOLDER, "Actions for this folder\u{2026}"),
+                        (ACTIONS_TERMINAL, "Open terminal here"),
+                        (ACTIONS_COMPRESS, "Compress\u{2026}"),
+                        (ACTIONS_EXTRACT, "Extract here"),
+                        (ACTIONS_EXTRACT_TO, "Extract to\u{2026}"),
+                    ]
+                    .map(|(step, action)| {
+                        (
+                            keys::label(&Keys::One(step.shown())),
+                            crate::i18n::tr(action),
+                        )
+                    }),
+                );
+                Chord::Action
+            }
+            InvocationSource::Background => Chord::FolderAction,
+        };
         self.armed_actions.replace(Some(ArmedActions {
             ids: numbered
                 .actions
@@ -275,24 +321,39 @@ impl Dispatcher {
                 .collect(),
             targets: numbered.targets,
         }));
-        self.shortcuts.arm_chord_with(Chord::Action, rows);
+        self.shortcuts.arm_chord_with(chord, rows);
     }
 
     pub(super) fn complete_action(&self, press: &KeyPress) -> bool {
-        if self.complete_folder_action(press) {
+        if self.complete_lettered_action(press) {
             self.armed_actions.take();
             return true;
         }
-        let Some((digit, slot)) = action_slot(press) else {
+        if press.is(ACTIONS_FOLDER) {
+            self.arm_actions(InvocationSource::Background);
+            return true;
+        }
+        self.complete_numbered_action(press, InvocationSource::Selection)
+    }
+
+    pub(super) fn complete_numbered_action(
+        &self,
+        press: &KeyPress,
+        source: InvocationSource,
+    ) -> bool {
+        let (digits, changed) = match source {
+            InvocationSource::Selection => (ACTIONS_NUMBERS, "Selection changed"),
+            InvocationSource::Background => (ACTIONS_FOLDER_NUMBERS, "Folder changed"),
+        };
+        let Some((digit, slot)) = action_slot(press, digits) else {
             return false;
         };
         let Some(armed) = self.armed_actions.take() else {
             return false;
         };
-        let numbered = self.view.numbered_actions();
+        let numbered = self.view.numbered_actions(source);
         if numbered.targets != armed.targets {
-            self.shortcuts
-                .show_feedback(&crate::i18n::tr("Selection changed"));
+            self.shortcuts.show_feedback(&crate::i18n::tr(changed));
             return true;
         }
         let Some(action) = numbered.actions.get(slot - 1).cloned() else {
@@ -309,7 +370,28 @@ impl Dispatcher {
         true
     }
 
-    fn complete_folder_action(&self, press: &KeyPress) -> bool {
+    /// Runs the action at `index` in Settings → Actions' order, as a default-map
+    /// slot key does. Nothing else runs in its place.
+    pub(super) fn run_listed_action(&self, index: usize) {
+        if crate::ui::actions::shared()
+            .catalog()
+            .actions()
+            .get(index)
+            .is_none()
+        {
+            self.shortcuts
+                .show_feedback(&rust_i18n::t!("No action %{digit}", digit = index + 1));
+            return;
+        }
+        match self.view.listed_action(index) {
+            Some((targets, action)) => self.view.run_numbered_action(targets, action),
+            None => self
+                .shortcuts
+                .show_feedback(&crate::i18n::tr("No matching actions")),
+        }
+    }
+
+    pub(super) fn complete_lettered_action(&self, press: &KeyPress) -> bool {
         use crate::ui::browser::TargetCommand;
         if press.is(ACTIONS_TERMINAL) {
             if !self.view.open_focused_folder_terminal() {
@@ -342,7 +424,7 @@ impl Dispatcher {
         true
     }
 
-    fn open_with_targets(&self) {
+    pub(super) fn open_with_targets(&self) {
         self.open_with.invalidate();
         let generation = self.open_with.generation.clone();
         let expected = generation.get();

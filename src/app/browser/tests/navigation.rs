@@ -727,6 +727,11 @@ fn previewing_a_file_in_a_parent_column_closes_deeper_columns_before_requesting(
 #[derive(Default)]
 struct FolderTree {
     listings: RefCell<HashMap<Location, Vec<FileEntry>>>,
+    /// While set, listings wait for `release` instead of answering at once.
+    held: Cell<bool>,
+    pending: RefCell<Vec<(DirectoryRequest, DirectoryEmit)>>,
+    hold_validation: Cell<bool>,
+    validations: RefCell<Vec<Validation>>,
 }
 
 impl FolderTree {
@@ -754,23 +759,25 @@ impl FolderTree {
             .borrow_mut()
             .insert(tree_location(directory), entries);
     }
-}
 
-/// Paths with a scheme are remote, which load in batches instead of a sorted snapshot.
-fn tree_location(path: &str) -> Location {
-    if path.contains("://") {
-        Location::uri(path)
-    } else {
-        Location::local(path)
-    }
-}
-
-impl FileSource for FolderTree {
-    fn validate_location(&self, _: &Location) -> Result<(), LocationValidationError> {
-        Ok(())
+    fn release(&self) {
+        self.held.set(false);
+        let pending = self.pending.take();
+        for (request, emit) in pending {
+            self.answer(&request, &emit);
+        }
     }
 
-    fn enumerate(&self, request: DirectoryRequest, emit: Rc<dyn Fn(DirectoryEvent)>) -> LoadHandle {
+    fn answer_validation(&self, location: &Location) {
+        let pending = self.validations.take();
+        let (_, emit) = pending
+            .into_iter()
+            .find(|(validated, _)| validated == location)
+            .expect("a pending validation");
+        emit(Ok(()));
+    }
+
+    fn answer(&self, request: &DirectoryRequest, emit: &DirectoryEmit) {
         let entries = self
             .listings
             .borrow()
@@ -787,6 +794,42 @@ impl FileSource for FolderTree {
             can_trash: None,
             can_delete: None,
         });
+    }
+}
+
+/// Paths with a scheme are remote, which load in batches instead of a sorted snapshot.
+fn tree_location(path: &str) -> Location {
+    if path.contains("://") {
+        Location::uri(path)
+    } else {
+        Location::local(path)
+    }
+}
+
+impl FileSource for FolderTree {
+    fn validate_location(&self, _: &Location) -> Result<(), LocationValidationError> {
+        Ok(())
+    }
+
+    fn validate_location_async(
+        &self,
+        location: Location,
+        emit: Rc<dyn Fn(Result<(), LocationValidationError>)>,
+    ) -> LoadHandle {
+        if self.hold_validation.get() {
+            self.validations.borrow_mut().push((location, emit));
+        } else {
+            emit(Ok(()));
+        }
+        LoadHandle::new(|| {})
+    }
+
+    fn enumerate(&self, request: DirectoryRequest, emit: Rc<dyn Fn(DirectoryEvent)>) -> LoadHandle {
+        if self.held.get() {
+            self.pending.borrow_mut().push((request, emit));
+        } else {
+            self.answer(&request, &emit);
+        }
         LoadHandle::new(|| {})
     }
 }
@@ -893,6 +936,169 @@ fn returning_to_an_ancestor_selects_the_folder_you_came_from() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[derive(Clone, Copy, Debug)]
+enum AncestorReach {
+    LeftAfterLoad,
+    LeftWhileLoading,
+    LeftWhileLoadingThenFolderGone,
+    FocusWithoutLeft,
+}
+
+impl AncestorReach {
+    fn while_loading(self) -> bool {
+        matches!(
+            self,
+            AncestorReach::LeftWhileLoading | AncestorReach::LeftWhileLoadingThenFolderGone
+        )
+    }
+}
+
+fn after_back_path() -> [Location; 4] {
+    [
+        Location::local("/fx"),
+        Location::local("/fx/alpha"),
+        Location::local("/fx/alpha/sub"),
+        Location::local("/fx/alpha/sub/inner"),
+    ]
+}
+
+/// Opens `/fx/alpha/sub/inner`, leaves, goes Back and reaches the `alpha` column.
+fn reach_ancestor_after_back(reach: AncestorReach) -> Rc<Browser> {
+    let (browser, _, tree) = folder_browser(FolderTree::with(&[
+        ("/fx", &["aa", "alpha"]),
+        ("/fx/alpha", &["a0", "sub"]),
+        ("/fx/alpha/sub", &["inner"]),
+        ("/fx/alpha/sub/inner", &["x"]),
+        ("/elsewhere", &["e"]),
+    ]));
+    let path = after_back_path();
+    browser.navigate(path[0].clone());
+    for depth in 0..3 {
+        browser.descend(depth, path[depth + 1].clone());
+    }
+    browser.navigate(Location::local("/elsewhere"));
+    let all_loaded = || {
+        (0..path.len()).all(|depth| {
+            browser
+                .column_snapshot(depth)
+                .is_some_and(|snapshot| !snapshot.loading)
+        })
+    };
+
+    tree.held.set(reach.while_loading());
+    browser.back();
+    if !reach.while_loading() {
+        pump_until(all_loaded);
+    }
+    match reach {
+        // Focus reaching the column without Left, as Tab or a click on its chrome does.
+        AncestorReach::FocusWithoutLeft => browser.set_active_column(1),
+        _ => {
+            browser.focus_parent();
+            browser.focus_parent();
+        }
+    }
+    if reach.while_loading() {
+        assert!(
+            browser
+                .column_snapshot(1)
+                .is_some_and(|snapshot| snapshot.loading),
+            "Left must reach the parent before it lists"
+        );
+        if matches!(reach, AncestorReach::LeftWhileLoadingThenFolderGone) {
+            tree.list("/fx/alpha", &["a0"]);
+        }
+        tree.release();
+        pump_until(all_loaded);
+    }
+    browser
+}
+
+#[test]
+fn after_back_file_commands_in_an_ancestor_column_never_target_its_parents_folder() {
+    let sub = Location::local("/fx/alpha/sub");
+    for (reach, target) in [
+        (AncestorReach::LeftAfterLoad, Some(&sub)),
+        (AncestorReach::LeftWhileLoading, Some(&sub)),
+        (AncestorReach::LeftWhileLoadingThenFolderGone, None),
+        (AncestorReach::FocusWithoutLeft, None),
+    ] {
+        let browser = reach_ancestor_after_back(reach);
+        let case = format!("{reach:?}");
+        assert_eq!(browser.active_depth(), Some(1), "{case}");
+        let open: Vec<_> = (0..)
+            .map_while(|depth| browser.location_at(depth))
+            .collect();
+        assert_eq!(open, after_back_path(), "{case}: every column stays open");
+        let renamed = browser.rename_item().map(|(_, _, entry)| entry.location);
+        let deleted: Vec<_> = browser
+            .deletion_entries()
+            .into_iter()
+            .map(|entry| entry.location)
+            .collect();
+        assert_eq!(renamed.as_ref(), target, "{case}");
+        assert_eq!(
+            deleted,
+            target.into_iter().cloned().collect::<Vec<_>>(),
+            "{case}"
+        );
+        if target.is_some() {
+            // A load cursor would send a paste into the column's folder instead.
+            assert!(!browser.selection_is_load_cursor(), "{case}");
+        }
+    }
+}
+
+#[test]
+fn making_a_column_first_keeps_later_columns_focus_and_cursor() {
+    let (browser, ..) = folder_browser(FolderTree::with(&[
+        ("/a", &["b"]),
+        ("/a/b", &["c", "d"]),
+        ("/a/b/c", &["e"]),
+    ]));
+    browser.navigate(Location::local("/a"));
+    browser.descend(0, Location::local("/a/b"));
+    browser.descend(1, Location::local("/a/b/c"));
+    browser.select(1, 0);
+    browser.extend_selection(1);
+    let strip = |browser: &Rc<Browser>| {
+        (0..)
+            .map_while(|depth| browser.location_at(depth))
+            .collect::<Vec<_>>()
+    };
+
+    assert!(browser.make_first_column(1));
+
+    assert_eq!(
+        strip(&browser),
+        [Location::local("/a/b"), Location::local("/a/b/c")]
+    );
+    assert_eq!(browser.active_depth(), Some(0));
+    assert_eq!(focused_location(&browser), Some(Location::local("/a/b/d")));
+    assert_eq!(
+        super::location_input::selected_locations(&browser),
+        [Location::local("/a/b/c"), Location::local("/a/b/d")]
+    );
+
+    assert!(!browser.make_first_column(0));
+    assert!(!browser.make_first_column(2));
+    assert_eq!(
+        strip(&browser),
+        [Location::local("/a/b"), Location::local("/a/b/c")],
+        "the first column has nothing to drop"
+    );
+
+    browser.back();
+    assert_eq!(
+        strip(&browser),
+        [
+            Location::local("/a"),
+            Location::local("/a/b"),
+            Location::local("/a/b/c")
+        ]
+    );
 }
 
 #[test]
@@ -1019,3 +1225,5 @@ fn a_remote_reload_announces_the_neighbour_cursor_of_an_inactive_column() {
         "the child column's cursor moves to z and is published"
     );
 }
+
+mod returning_columns;

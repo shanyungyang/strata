@@ -2,8 +2,66 @@
 
 use super::*;
 use crate::model::Location;
+use crate::test_support::PrivateContext;
 use gtk::{gio, glib};
 use std::time::{Duration, Instant};
+
+#[test]
+fn window_presence_dismisses_completion_without_discarding_the_path() {
+    crate::test_support::gtk_test(
+        "ui::browser::location::tests::window_presence_dismisses_completion_without_discarding_the_path",
+        || {
+            let fixture = tempfile::tempdir().expect("fixture");
+            std::fs::create_dir(fixture.path().join("documents")).expect("completion folder");
+            let view = BrowserView::new(
+                Rc::new(crate::adapters::LocalFileSource),
+                crate::ui::browser::PeekBehavior::default(),
+            );
+            let content = gtk::Box::new(gtk::Orientation::Vertical, 0);
+            content.append(&view.location_widget());
+            content.append(&view.widget());
+            let window = gtk::Window::builder().child(&content).build();
+            window.present();
+            view.browser().navigate(Location::local(fixture.path()));
+            wait_until(
+                || {
+                    view.browser()
+                        .column_snapshot(0)
+                        .is_some_and(|snapshot| !snapshot.loading)
+                },
+                "the folder loads",
+            );
+            view.state.begin_location_edit();
+            let popover = descendants(view.state.location_entry.upcast_ref())
+                .into_iter()
+                .find_map(|widget| widget.downcast::<gtk::Popover>().ok())
+                .expect("completion popover");
+
+            let path = format!("{}/doc", fixture.path().display());
+            view.state.location_entry.set_text(&path);
+            wait_until(|| popover.is_visible(), "suggestions visible");
+
+            view.set_presence(crate::app::Presence::Visible, false);
+
+            assert!(!popover.is_visible(), "losing focus dismisses suggestions");
+            assert_eq!(view.state.location_entry.text().as_str(), path);
+            assert!(view.location_edit_is_active());
+            view.state.location_entry.set_text("~");
+            assert!(
+                !popover.is_visible(),
+                "inactive edits cannot reopen suggestions"
+            );
+
+            view.set_presence(crate::app::Presence::Focused, false);
+            view.state.location_entry.set_text(&path);
+            wait_until(
+                || popover.is_visible(),
+                "suggestions return once the window is focused again",
+            );
+            window.destroy();
+        },
+    );
+}
 
 #[test]
 fn password_storage_selection_maps_to_gio_values() {
@@ -87,6 +145,20 @@ fn remote_permission_denials_are_treated_as_authentication_failures() {
 }
 
 #[test]
+fn a_refused_polkit_prompt_neither_asks_for_credentials_nor_reports_an_error() {
+    let administrator = Location::uri("admin:///run/media/user/drive/backups");
+    let denied = glib::Error::new(gio::IOErrorEnum::PermissionDenied, "Permission denied");
+    assert!(!mount_error_is_authentication_failure(
+        &administrator,
+        &denied
+    ));
+    assert_eq!(mount_failure_message(&administrator, &denied), None);
+
+    let failed = glib::Error::new(gio::IOErrorEnum::Failed, "helper crashed");
+    assert!(mount_failure_message(&administrator, &failed).is_some());
+}
+
+#[test]
 fn cancelling_the_credential_prompt_produces_no_error_message() {
     let location = Location::uri("smb://host/share");
     for kind in [gio::IOErrorEnum::Cancelled, gio::IOErrorEnum::FailedHandled] {
@@ -146,6 +218,13 @@ fn sftp_failure_guidance_and_host_key_rejection_do_not_reopen_credentials() {
             .expect("trust rejection is reportable")
             .contains("fingerprint")
     );
+    let lost = glib::Error::new(gio::IOErrorEnum::Failed, "Connection failed");
+    assert!(!mount_error_is_authentication_failure(&location, &lost));
+    assert!(
+        mount_failure_message(&location, &lost)
+            .expect("a dropped session is reportable")
+            .contains("server is running")
+    );
     let wrong_password = glib::Error::new(
         gio::IOErrorEnum::Failed,
         "Permission denied (publickey,password)",
@@ -156,6 +235,36 @@ fn sftp_failure_guidance_and_host_key_rejection_do_not_reopen_credentials() {
     ));
 }
 
+/// GVfs-SMB carries the connection errno only as `g_strerror` text after a
+/// `G_IO_ERROR_FAILED` prefix; an unresolvable host reports just EINVAL.
+#[test]
+fn smb_connection_failures_reported_as_errno_text_get_transport_guidance() {
+    let location = Location::uri("smb://127.0.0.1:1/share");
+    let unexpected = crate::i18n::tr(crate::services::UNEXPECTED_SYSTEM_ERROR);
+    for (message, expected) in [
+        ("Failed to mount Windows share: Connection refused", "port"),
+        (
+            "Failed to retrieve share list from server: Connection refused",
+            "port",
+        ),
+        (
+            "Failed to mount Windows share: Connection timed out",
+            "firewall",
+        ),
+        ("Failed to mount Windows share: No route to host", "network"),
+        (
+            "Failed to mount Windows share: Invalid argument",
+            &unexpected,
+        ),
+        ("Connection refused: proxy handshake", &unexpected),
+    ] {
+        let error = glib::Error::new(gio::IOErrorEnum::Failed, message);
+        assert!(!mount_error_is_authentication_failure(&location, &error));
+        let reported = mount_failure_message(&location, &error).expect("reportable failure");
+        assert!(reported.contains(expected), "{message}: {reported}");
+    }
+}
+
 #[test]
 fn backend_failures_do_not_echo_uri_secrets() {
     let location = Location::uri("sftp://host.example/home/alice");
@@ -164,7 +273,10 @@ fn backend_failures_do_not_echo_uri_secrets() {
         "Unable to mount sftp://alice:hunter2@host.example/home/alice?token=hidden#secret",
     );
     let message = mount_failure_message(&location, &error).expect("reportable error");
-    assert!(message.contains("sftp://host.example/home/alice"));
+    assert_eq!(
+        message,
+        crate::i18n::tr(crate::services::UNEXPECTED_SYSTEM_ERROR)
+    );
     assert!(!message.contains("hunter2"));
     assert!(!message.contains("alice:"));
     assert!(!message.contains("hidden"));
@@ -289,7 +401,7 @@ fn external_volume_mount_completion_is_success() {
 
 #[test]
 fn foreign_mount_wait_finishes_on_signal_poll_or_timeout() {
-    let context = glib::MainContext::new();
+    let context = PrivateContext::new();
     context.block_on(async {
         let (send, receive) = oneshot::channel();
         let signal = async {
@@ -876,12 +988,16 @@ fn breadcrumb_adjustment_does_not_retain_widgets() {
                 Rc::new(crate::adapters::LocalFileSource),
                 crate::ui::browser::PeekBehavior::default(),
             );
-            let adjustment = view.state.breadcrumb_scroller.hadjustment();
             let container = view
                 .state
                 .location_stack
                 .child_by_name("breadcrumbs")
                 .expect("breadcrumb container");
+            let adjustment = descendants(&container)
+                .into_iter()
+                .find_map(|widget| widget.downcast::<gtk::ScrolledWindow>().ok())
+                .expect("breadcrumb scroller")
+                .hadjustment();
             let scrollbar = descendants(&container)
                 .into_iter()
                 .filter(|widget| widget.has_css_class("breadcrumb-scrollbar"))
@@ -1167,4 +1283,84 @@ fn a_folder_arriving_while_a_location_is_typed_keeps_the_entry_open() {
             window.destroy();
         },
     );
+}
+
+/// Icons and List show only the active folder, so the location bar and Ctrl+L stop
+/// naming a child that Columns mirrored beside it.
+#[test]
+fn leaving_columns_names_the_active_folder_instead_of_its_mirrored_child() {
+    use crate::ui::browser_modes::BrowserMode;
+    crate::test_support::gtk_test(
+        "ui::browser::location::tests::leaving_columns_names_the_active_folder_instead_of_its_mirrored_child",
+        || {
+            let root = tempfile::tempdir().expect("fixture");
+            let beta = root.path().join("beta");
+            std::fs::create_dir(&beta).expect("folder");
+            let (view, window, _overlay) = hosted_browser();
+            let loaded = |depth: usize| {
+                view.browser()
+                    .column_snapshot(depth)
+                    .is_some_and(|snapshot| !snapshot.loading)
+            };
+            view.set_view_mode(BrowserMode::Columns);
+            view.browser().navigate(Location::local(root.path()));
+            wait_until(|| loaded(0), "the folder loads");
+            view.browser().show_child(0, Location::local(&beta));
+            wait_until(|| loaded(1), "the mirrored child loads");
+            let root_path = Location::local(root.path()).display_path();
+            let beta_path = Location::local(&beta).display_path();
+            assert_eq!(view.browser().active_depth(), Some(0));
+            assert_eq!(view.state.location_entry.text(), beta_path);
+            assert_eq!(
+                current_hierarchy_item(&view).as_deref(),
+                Some("beta"),
+                "the hierarchy menu marks the child the breadcrumbs name"
+            );
+
+            view.set_view_mode(BrowserMode::List);
+            assert_eq!(
+                view.state.location_entry.text(),
+                root_path,
+                "List shows the active folder"
+            );
+
+            view.set_view_mode(BrowserMode::Columns);
+            assert_eq!(
+                view.state.location_entry.text(),
+                beta_path,
+                "Columns shows the mirrored child again"
+            );
+            view.state.cancel_location_edit();
+            assert_eq!(
+                view.state.location_entry.text(),
+                beta_path,
+                "Esc restores the folder the breadcrumbs name"
+            );
+            window.destroy();
+            view.browser().clear_observer();
+        },
+    );
+}
+
+/// Opens the breadcrumb hierarchy menu and reads the label of the item marked current.
+fn current_hierarchy_item(view: &BrowserView) -> Option<String> {
+    let anchor = view.widget();
+    view.state.show_breadcrumb_hierarchy_menu(&anchor, 0.0);
+    let popover = descendants(&anchor)
+        .into_iter()
+        .filter(|widget| widget.has_css_class("breadcrumb-popover"))
+        .find_map(|widget| widget.downcast::<gtk::Popover>().ok())
+        .expect("hierarchy menu");
+    let current = descendants(popover.upcast_ref())
+        .into_iter()
+        .filter(|widget| widget.has_css_class("breadcrumb-hierarchy-item"))
+        .find(|widget| widget.has_css_class("current"))
+        .and_then(|item| {
+            descendants(&item)
+                .into_iter()
+                .find_map(|widget| widget.downcast::<gtk::Label>().ok())
+        })
+        .map(|label| label.text().to_string());
+    popover.popdown();
+    current
 }

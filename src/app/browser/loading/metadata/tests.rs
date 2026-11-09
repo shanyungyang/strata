@@ -48,10 +48,12 @@ fn update(fixture: &Fixture, name: &str) -> MetadataUpdate {
         location: fixture.entry(name).location,
         size: MetadataValue::Known(41),
         modified_unix_seconds: MetadataValue::Known(123),
+        created_unix_seconds: MetadataValue::Unknown,
         mode: MetadataValue::Known(0o644),
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
     }
 }
 
@@ -167,16 +169,19 @@ fn positioned_updates_keep_token_membership_and_update_order() {
         location: fixture_location.clone(),
         size: MetadataValue::Known(41),
         modified_unix_seconds: MetadataValue::Unknown,
+        created_unix_seconds: MetadataValue::Unknown,
         mode: MetadataValue::Unknown,
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
     };
     let other = MetadataUpdate {
         location: Location::local("/fixture/other"),
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
         ..update.clone()
     };
     let later = MetadataUpdate {
@@ -184,6 +189,7 @@ fn positioned_updates_keep_token_membership_and_update_order() {
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
         ..update.clone()
     };
     let positioned = position_updates(

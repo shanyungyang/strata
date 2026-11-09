@@ -75,12 +75,14 @@ fn renamed_directory(location: Location) -> FileEntry {
         kind: EntryKind::Directory,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
+        created_unix_seconds: MetadataValue::Unknown,
         recent_unix_seconds: MetadataValue::Unknown,
         recent_uri: None,
         mode: MetadataValue::Unknown,
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
         is_hidden: false,
     }
 }

@@ -68,6 +68,8 @@ pub(in crate::ui) fn non_default_preferences() -> Preferences {
         sidebar_show_pictures: false,
         sidebar_show_videos: false,
         sidebar_expanded: false,
+        sidebar_pinned_collapsed: true,
+        sidebar_devices_collapsed: true,
         sidebar_compact: true,
         show_hidden: true,
         text_size: TextSize::new(24),
@@ -78,12 +80,15 @@ pub(in crate::ui) fn non_default_preferences() -> Preferences {
         folders_first: false,
         sort_key: "size".into(),
         sort_direction: "descending".into(),
+        natural_sort: false,
+        case_sensitive_sort: true,
         check_for_updates: false,
         preview_muted: true,
         preview_volume: 0.35,
-        preview_text_wrap: true,
+        preview_text_wrap: false,
         unit_system: UnitSystem::Imperial,
         preview_autoplay: true,
+        preview_video_start: 20,
         watch_network_folders: false,
         thumbnail_workers: 6,
         show_thumbnails: false,
@@ -136,7 +141,35 @@ pub(in crate::ui) fn non_default_preferences() -> Preferences {
             ListColumnId::Mode,
         ],
         list_hidden_columns: vec![ListColumnId::Mode],
+        keymap: KeymapOverrides {
+            default: [("settings", &["<Control>comma", "<Control><Alt>F12"][..])]
+                .into_iter()
+                .map(keymap_entry)
+                .collect(),
+            tenxer: [
+                (
+                    "focus_sidebar",
+                    &["<Control><Shift>b", "<Control><Alt>F11"][..],
+                ),
+                ("future.command", &["x"][..]),
+            ]
+            .into_iter()
+            .map(keymap_entry)
+            .collect(),
+        },
     }
+}
+
+pub(in crate::ui) fn keymap_entry((id, accelerators): (&str, &[&str])) -> (String, toml::Value) {
+    (
+        id.to_owned(),
+        toml::Value::Array(
+            accelerators
+                .iter()
+                .map(|accelerator| toml::Value::String((*accelerator).to_owned()))
+                .collect(),
+        ),
+    )
 }
 
 pub(in crate::ui) fn seed_saved_preferences_for_test() {
@@ -166,5 +199,29 @@ pub(in crate::ui) fn seed_omarchy_colors_for_test(colors: &str) {
 impl PreferenceManager {
     pub(in crate::ui) fn seed_saved_preferences_for_test() {
         seed_saved_preferences_for_test();
+    }
+
+    /// Saves the exhaustive fixture outside 10xer mode, with only these keymap
+    /// overrides: command ids and their accelerators.
+    pub(in crate::ui) fn seed_saved_keymap_for_test(
+        default: &[(&str, &[&str])],
+        tenxer: &[(&str, &[&str])],
+    ) {
+        let preferences = Preferences {
+            tenxer_mode: false,
+            keymap: KeymapOverrides {
+                default: default.iter().copied().map(keymap_entry).collect(),
+                tenxer: tenxer.iter().copied().map(keymap_entry).collect(),
+            },
+            ..non_default_preferences()
+        };
+        let path = settings_path();
+        fs::create_dir_all(path.parent().expect("settings parent"))
+            .expect("isolated preferences directory");
+        fs::write(
+            path,
+            toml::to_string(&preferences).expect("serialize keymap fixture"),
+        )
+        .expect("persist keymap fixture");
     }
 }

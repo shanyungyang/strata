@@ -83,6 +83,37 @@ fn stale_progress_and_terminals_cannot_contaminate_a_replacement_transfer() {
 }
 
 #[test]
+fn removed_entry_counts_reach_observers_only_from_the_current_deletion() {
+    let (browser, events, _) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
+    browser.navigate(Location::local("/fixture"));
+    let stale_id = browser.begin_operation();
+    let stale = browser.operation_callback(stale_id, false, HashSet::new());
+    let request_id = browser.begin_operation();
+    let current = browser.operation_callback(request_id, false, HashSet::new());
+    events.borrow_mut().clear();
+
+    stale(OperationEvent::DeleteEntriesRemoved {
+        request_id: stale_id,
+        removed: 10,
+    });
+    assert!(events.borrow().is_empty());
+
+    current(OperationEvent::DeleteEntriesRemoved {
+        request_id,
+        removed: 25,
+    });
+    let counts: Vec<_> = events
+        .borrow()
+        .iter()
+        .filter_map(|event| match event {
+            BrowserEvent::DeletionEntriesRemoved { removed } => Some(*removed),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(counts, [25]);
+}
+
+#[test]
 fn cancelling_transfer_blocks_new_mutations_until_its_terminal_event() {
     let (browser, events, _) = scripted_browser(ScriptedSource::manual(vec![], vec![]));
     let request_id = browser.begin_operation();
@@ -92,6 +123,7 @@ fn cancelling_transfer_blocks_new_mutations_until_its_terminal_event() {
     assert!(browser.transfer_cancel_pending.get());
     assert!(browser.try_begin_operation().is_none());
     browser.set_operation_provider(Rc::new(ImmediateOperationProvider));
+    assert!(!browser.can_start_operation());
     browser.transfer(
         Location::local("/fixture/destination"),
         vec![PasteItem {
@@ -122,6 +154,7 @@ fn cancelling_transfer_blocks_new_mutations_until_its_terminal_event() {
     });
     assert!(!browser.transfer_cancel_pending.get());
     assert!(!browser.is_current_operation(request_id));
+    assert!(browser.can_start_operation());
     assert!(browser.try_begin_operation().is_some());
 }
 

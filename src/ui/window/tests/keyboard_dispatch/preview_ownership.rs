@@ -65,7 +65,7 @@ impl PreviewProvider for OwnershipPreview {
     }
 }
 
-fn ownership_fixture() -> KeyboardFixture {
+pub(super) fn ownership_fixture() -> KeyboardFixture {
     let fixture = KeyboardFixture::with_provider(Rc::new(OwnershipPreview));
     let root = fixture._directory.path();
     std::fs::write(root.join("long.txt"), b"long").expect("long document");
@@ -255,6 +255,13 @@ fn tenxer_preview_owns_document_keys_until_returned() {
             let launched = glib::user_data_dir().join("launched");
             default_recorder_app("text/plain", &launched);
             let fixture = ownership_fixture();
+            let bookmark = tempfile::tempdir().expect("original bookmark");
+            glib::MainContext::default()
+                .block_on(crate::services::letter_bookmarks::set(
+                    'j',
+                    bookmark.path().to_path_buf(),
+                ))
+                .expect("seed bookmark j");
             let browser = fixture.view.browser();
             let origin = browser.active_location();
             let opened = record_opens(&browser);
@@ -273,7 +280,15 @@ fn tenxer_preview_owns_document_keys_until_returned() {
                         "the column yields its destination to the preview"
                     );
                 }
-                for key in [Key::l, Key::Right, Key::space, Key::v, Key::q] {
+                for key in [
+                    Key::l,
+                    Key::Right,
+                    Key::space,
+                    Key::v,
+                    Key::q,
+                    Key::m,
+                    Key::apostrophe,
+                ] {
                     assert!(
                         fixture.press(key, ModifierType::empty()),
                         "{mode:?} {key:?}"
@@ -282,6 +297,7 @@ fn tenxer_preview_owns_document_keys_until_returned() {
                         preview_has_focus(&fixture),
                         "{mode:?} {key:?} kept the keys"
                     );
+                    assert_eq!(fixture.shortcuts.armed_chord(), None);
                 }
                 assert_eq!(fixture.selected(), selection, "{mode:?}");
                 assert_eq!(browser.active_location(), origin, "{mode:?}");
@@ -303,6 +319,17 @@ fn tenxer_preview_owns_document_keys_until_returned() {
                 );
 
                 let top = document_scroll(&fixture);
+                fixture.press(Key::m, ModifierType::empty());
+                fixture.press(Key::j, ModifierType::empty());
+                assert!(preview_has_focus(&fixture));
+                assert_eq!(
+                    glib::MainContext::default()
+                        .block_on(crate::services::letter_bookmarks::get('j'))
+                        .expect("read bookmark j"),
+                    Some(bookmark.path().to_path_buf()),
+                    "preview m j must not overwrite a bookmark"
+                );
+                fixture.press(Key::Home, ModifierType::empty());
                 for (key, modifiers) in [
                     (Key::j, ModifierType::empty()),
                     (Key::Down, ModifierType::empty()),
@@ -585,36 +612,59 @@ fn tenxer_preview_owns_document_keys_until_returned() {
 }
 
 #[test]
-fn default_editing_keys_reach_a_focused_preview() {
+fn default_editing_and_file_keys_stay_in_a_focused_preview() {
     crate::test_support::gtk_test(
-        "ui::window::tests::keyboard_dispatch::preview_ownership::default_editing_keys_reach_a_focused_preview",
+        "ui::window::tests::keyboard_dispatch::preview_ownership::default_editing_and_file_keys_stay_in_a_focused_preview",
         || {
             use crate::ui::browser::{ClipboardMark, clipboard_mark};
             let fixture = ownership_fixture();
             PreferenceManager::shared().set_tenxer_mode(false);
             let names = directory_names(fixture._directory.path());
-            select_named(&fixture, "long.txt");
-            let selection = fixture.selected();
-            assert!(fixture.press(Key::space, ModifierType::empty()));
-            let document = || {
-                widget_with_class(&fixture.preview.widget(), "preview-virtual-list")
-                    .filter(gtk::Widget::is_mapped)
-            };
-            wait_until(|| document().is_some());
-            assert!(document().expect("document").grab_focus());
-            for key in [Key::a, Key::c, Key::v, Key::x] {
-                assert!(
-                    !fixture.press(key, ModifierType::CONTROL_MASK),
-                    "Ctrl+{key:?} goes to the document"
+            let none = ModifierType::empty();
+            let control = ModifierType::CONTROL_MASK;
+            for (name, surface) in [
+                ("long.txt", "preview-virtual-list"),
+                ("bundle.zip", "preview-archive-list"),
+            ] {
+                select_named(&fixture, name);
+                focus_files(&fixture);
+                let selection = fixture.selected();
+                assert!(fixture.press(Key::space, none));
+                let content = || {
+                    widget_with_class(&fixture.preview.widget(), surface)
+                        .filter(gtk::Widget::is_mapped)
+                };
+                wait_until(|| content().is_some());
+                assert!(content().expect("preview content").grab_focus());
+                for (key, modifiers) in [
+                    (Key::a, control),
+                    (Key::c, control),
+                    (Key::v, control),
+                    (Key::x, control),
+                    (Key::d, control),
+                    (Key::r, control),
+                    (Key::n, control | ModifierType::ALT_MASK),
+                    (Key::F2, none),
+                    (Key::Delete, none),
+                    (Key::Delete, ModifierType::SHIFT_MASK),
+                ] {
+                    assert!(
+                        !fixture.press(key, modifiers),
+                        "{modifiers:?} {key:?} goes to the {name} preview"
+                    );
+                    assert!(preview_has_focus(&fixture), "{name}: {modifiers:?} {key:?}");
+                }
+                assert!(!fixture.view.rename_is_active(), "{name}: no rename");
+                assert!(!modal_visible(&fixture.overlay), "{name}: no confirmation");
+                assert_eq!(fixture.selected(), selection, "Ctrl+A selects no files");
+                assert_eq!(
+                    clipboard_mark(&Location::local(fixture._directory.path().join(name))),
+                    ClipboardMark::None,
+                    "Ctrl+C and Ctrl+X mark no files"
                 );
-                assert!(preview_has_focus(&fixture), "{key:?}");
+                fixture.press(Key::Escape, none);
+                wait_until(|| !fixture.preview.is_enabled() && fixture.view.item_view_has_focus());
             }
-            assert_eq!(fixture.selected(), selection, "Ctrl+A selects no files");
-            assert_eq!(
-                clipboard_mark(&Location::local(fixture._directory.path().join("long.txt"))),
-                ClipboardMark::None,
-                "Ctrl+C and Ctrl+X mark no files"
-            );
             assert_eq!(directory_names(fixture._directory.path()), names);
         },
     );
@@ -810,7 +860,16 @@ fn tenxer_interactive_previews_keep_a_defined_key_owner() {
                 owner_bar(&fixture),
                 "rebuilt archive rows keep the owner bar"
             );
-            for key in [Key::l, Key::Return, Key::space, Key::v, Key::j, Key::G] {
+            for key in [
+                Key::l,
+                Key::Return,
+                Key::space,
+                Key::v,
+                Key::j,
+                Key::G,
+                Key::m,
+                Key::apostrophe,
+            ] {
                 let modifiers = if key == Key::G {
                     ModifierType::SHIFT_MASK
                 } else {
@@ -818,6 +877,7 @@ fn tenxer_interactive_previews_keep_a_defined_key_owner() {
                 };
                 assert!(fixture.press(key, modifiers), "{key:?}");
                 assert!(archive_has_focus(&fixture), "{key:?} stays in the archive");
+                assert_eq!(fixture.shortcuts.armed_chord(), None);
             }
             fixture.press(Key::h, ModifierType::empty());
             assert!(

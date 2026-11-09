@@ -89,7 +89,8 @@ pass before merge.
   `./scripts/qa.sh arrow-keys-move-focus/columns-arrows`; `qa.sh` rejects unknown
   names and fails a selection that runs no scenario. `scripts/qa.sh` is the
   canonical pinned-container GUI runner. `scripts/quality.sh` accepts only
-  `all`, `fmt`, `clippy`, or `test` and does not forward test filters.
+  `all`, `fmt`, `clippy`, or `test`, plus `--jobs N` and `--refresh-timings`
+  for the test phase, and does not forward test filters.
 - Use full pinned `./scripts/quality.sh` phases and a full `./scripts/qa.sh`
   run when impact is broad or uncertain. Escalate to both for shared infrastructure, dependencies,
   build/CI/harness code, cross-cutting behavior, or uncertain coverage.
@@ -215,6 +216,25 @@ pass before merge.
   or expensive execution do not establish redundant coverage. Preserve separate
   input-routing, lifecycle, filesystem-safety, and live-preference regressions.
 
+## Code health
+
+CodeScene scores every file; `scripts/code-health.sh <files>` prints the score
+and the function-level findings, and `scripts/code-health.sh --changed` reviews
+the files changed against `origin/main`. It needs `CS_ACCESS_TOKEN`.
+
+- A change must not lower the code health of the files it touches. Run the
+  script on them before pushing and fix new findings in the same change.
+- Put new behavior in a new submodule instead of growing a file past about
+  1,500 lines. Keep functions under about 70 lines and a cyclomatic complexity
+  under 9; extract signal handlers and builder stages into named functions.
+- Pass more than four values through a context, options, or request struct
+  instead of positional arguments.
+- Name complex conditions as predicates, and keep nesting under four levels.
+- Share one implementation between the list and icons modes and between
+  parallel copy/move/restore paths instead of duplicating a function per mode.
+- In tests, share fixtures and assertion helpers and use table-driven cases
+  instead of repeating large assertion blocks.
+
 ## Saved preferences
 
 - Follow `docs/preferences.md` when adding or changing application-wide settings.
@@ -225,10 +245,10 @@ pass before merge.
 ## Internationalization
 
 - Every new or changed application-owned, user-facing string must be localized
-  with `rust-i18n` and added or updated in **all twelve supported languages in the
-  same change**: English, French, German, Spanish, Japanese, Brazilian Portuguese,
-  Korean, Vietnamese, Italian, Russian, Simplified Chinese, and Traditional
-  Chinese. This includes labels, buttons, menus, placeholders, tooltips,
+  with `rust-i18n` and added or updated in **all thirteen supported languages in the
+  same change**: English, French, Hungarian, German, Spanish, Japanese, Brazilian
+  Portuguese, Korean, Vietnamese, Italian, Russian, Simplified Chinese, and
+  Traditional Chinese. This includes labels, buttons, menus, placeholders, tooltips,
   accessibility names/descriptions, dialogs, help text, errors, notifications,
   and status/progress messages.
 - Follow `docs/internationalization.md` and update the matching catalogs under

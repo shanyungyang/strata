@@ -85,6 +85,7 @@ pub(super) struct AudioView {
     shown_seconds: Cell<(i64, i64)>,
     stem: RefCell<String>,
     folder: Cell<Option<ListingPosition>>,
+    tags: RefCell<AudioTags>,
     details: RefCell<Option<details::DetailsLoad>>,
     peaks: RefCell<Option<details::PeaksLoad>>,
     ease: Rc<EaseIn>,
@@ -138,10 +139,11 @@ impl AudioView {
         play.add_css_class("preview-media-center");
         play.add_css_class("preview-audio-play");
         play.set_child(Some(&play_icon));
-        play.set_tooltip_text(Some(&crate::ui::shortcut_reference::with_keys(
+        crate::ui::shortcut_reference::follow_tooltip(
+            &play,
             "Play/Pause (%{keys})",
-            crate::ui::keys::Keys::One(crate::ui::keys::bindings::MEDIA_PLAY_PAUSE),
-        )));
+            crate::ui::keys::Keys::One(crate::ui::keys::bindings::MEDIA_PLAY_PAUSE.shown()),
+        );
         crate::ui::accessibility::set_label(&play, &crate::i18n::tr("Play or pause"));
         let transport = navigation_row(&previous, &play, &next, 10);
         transport.set_start_widget(Some(&elapsed));
@@ -178,6 +180,7 @@ impl AudioView {
             shown_seconds: Cell::new((-1, -1)),
             stem: RefCell::default(),
             folder: Cell::default(),
+            tags: RefCell::default(),
             details: RefCell::default(),
             peaks: RefCell::default(),
             ease: EaseIn::new(EASE_IN_RAMP),
@@ -416,9 +419,26 @@ impl AudioView {
         }
     }
 
-    fn show_tags(&self, tags: &AudioTags) {
-        let caption = track_caption(tags, self.folder.get());
+    pub(super) fn set_listing(
+        &self,
+        folder: Option<ListingPosition>,
+        has_previous: bool,
+        has_next: bool,
+    ) {
+        self.previous.set_sensitive(has_previous);
+        self.next.set_sensitive(has_next);
+        self.folder.set(folder);
+        self.show_caption();
+    }
+
+    fn show_caption(&self) {
+        let caption = track_caption(&self.tags.borrow(), self.folder.get());
         self.eyebrow.set_text(caption.as_deref().unwrap_or(""));
+    }
+
+    fn show_tags(&self, tags: &AudioTags) {
+        self.tags.replace(tags.clone());
+        self.show_caption();
         self.title
             .set_text(tags.title.as_deref().unwrap_or(&self.stem.borrow()));
         self.artist.set_text(tags.artist.as_deref().unwrap_or(""));

@@ -30,7 +30,7 @@ Line 1 of the file, one JSON object. Unknown keys are rejected.
 | --- | --- | --- |
 | `scenario` | yes | Equals the file stem. Lowercase words of `a-z0-9` joined by `-`; unique across all folders. |
 | `modes` | yes | Views to run in: any of `columns`, `icons`, `list`. Each mode is one run. The runner writes `browser_mode` for the run's mode last, over every `prefs`. |
-| `prefs` | no | Preference overrides written into `settings.toml` over the fixture manifest's defaults (`tests/fixtures/harness.json`, key `preferences`). |
+| `prefs` | no | Preference overrides written into `settings.toml` over the fixture manifest's defaults (`tests/fixtures/harness.json`, key `preferences`). An object value becomes a TOML table: `{"keymap":{"default":{"rename":["<Control>e"]}}}`. |
 | `layout` | no | Keyboard layout switched to once the app is ready; default `us`. One of the manifest's `layouts`: `us`, `ru`, `ru-only`, `fr`, `de`, `caps-lock`, `cn-altgr-pinyin`. Key names always mean US key positions. |
 | `variants` | no | `[{"id":..., "modes", "prefs", "layout", "vars", "tree", "setup", "teardown"}]`. Each variant reruns the file; its `modes` replace the header's, `prefs` and `layout` apply over the header's, `vars` become `$variables`, `tree` replaces the header's, `setup` runs after the header's and `teardown` after the header's. Run labels become `<mode>-<id>`. |
 | `tree` | no | A manifest tree name (default `canonical`) or an inline tree: an object of directories (objects) and files (text). `{000..199}.txt` expands to one zero-padded file per number with `{}` in its text replaced by the number; a file's text may be a list of strings and `{"repeat":"r-{},{}\n","from":0,"to":999}`. Directories get mode 755, files 644, and every time is pinned to the manifest's `mtime`. |
@@ -41,6 +41,7 @@ Line 1 of the file, one JSON object. Unknown keys are rejected.
 | `env` | no | Variables added to the app's environment, `$variables` replaced. Never one the runner owns (`RUNNER_OWNED_ENVIRONMENT`, `XDG_DIRECTORIES`, and `QA_ENVIRONMENT` in `tests/qa.rs`): the display, buses, runtime, HOME and XDG directories, input log, shader cache, and accessibility switches. |
 | `session_bus` | no | `true` starts a private session bus with no service directories, shared by the app and the `dbus_send`, `launch`, and `foreign` steps (all three require it). Without it the app gets a bus address that cannot connect. |
 | `portal` | no | `true` (requires `session_bus`) starts `strata --qa --portal`, the FileChooser portal backend, instead of the browser. There is no window until `portal_open`; `adopt` then drives the chooser. Until a chooser opens, the snapshot is empty. |
+| `input_method` | no | An fcitx5 input method name such as `chewing` or `pinyin` (requires `session_bus`): starts a private fcitx5 on the run's display and bus whose group holds the US keyboard and that method; Ctrl+Space switches to it. Pick the toolkit path with `env` (`GTK_IM_MODULE`). Host runs only, since the pinned image has no fcitx5; give such a scenario a `skip` reason. See "Wayland and input methods" in `docs/testing.md`. |
 | `fixture_root` | no | `/tmp/<name>`: builds the tree at that fixed path instead of a fresh one, for a screenshot where the path renders. The path must not exist (never reused); runs with a `fixture_root` never overlap one another. |
 | `mutation` | no | The name of a patch in `tests/qa/mutations/` (without `.patch`) that must make the scenario fail; each patch belongs to one scenario. `./scripts/qa-mutation.sh` checks it. Not combinable with `skip`. |
 | `known_bug` | no | An issue reference. A failure becomes the expected result. Needs `known_bug_step`. |
@@ -107,7 +108,7 @@ the main context drains. Input is real XTEST.
 | Step | Meaning |
 | --- | --- |
 | `{"key":"ctrl+x","repeat":2}` | Taps a chord (`ctrl`, `shift`, `alt`, `altgr` + a GDK key name such as `Return`, `F2`, `period`, `Page_Down`); the key comes up 20 ms after it went down. |
-| `{"type":"nested-notes"}` | One key tap per character. |
+| `{"type":"nested-notes"}` | One key tap per character. A character the layout lacks (`é`, `名`) is typed on an empty keycode lent that keysym for the tap and then restored, as xdotool does; X11 only. |
 | `{"key_down":"ctrl"}`, `{"key_up":"Escape"}` | One modifier or key down or up, no tap, no pause. |
 | `{"click":TARGET,"button":1,"count":1,"mods":["shift"],"at":[4,"50%"]}` | Moves to the target and clicks. `button` 3 is a right-click, `count` 2 a double-click. `"release_mods_first":true` lifts the modifiers between press and release. `"left_bound":"browser"` keeps the aim right of a remembered box's left edge. |
 | `{"select":{"entry":"readme.md","dir":"$root"}}` | Clicks the entry, and again after 4 s if it is still not selected. |
@@ -128,6 +129,7 @@ the main context drains. Input is real XTEST.
 | `{"reveal_control":{"role":"spin button","name":"Text size in pixels"}}` | Scrolls a settings page's own pane until the control is wholly shown, then settles it. |
 | `{"adopt":"PNG conversion test","timeout_ms":20000,"message":"..."}` | Portal runs: waits for a showing window with this title and drives it from then on (snapshot, targets, input log). |
 | `{"clipboard_set":"text"}`, `{"clipboard":"999","message":"..."}` | Owns the clipboard with the text from a second display connection; reads the clipboard and fails unless it matches, exactly or as `{"starts_with":...,"contains":...,"longer_than":5}`. |
+| `{"clipboard_set":{"offers":[{"mime":"x-special/gnome-copied-files","text":"cut\nfile://$fixture_quoted/a.txt"}]}}`, `{"clipboard":"1","mime":"application/x-kde-cutselection"}` | Owns the clipboard with raw offers under their MIME types, the way a file manager fills it; reads one MIME type's bytes as text instead of the clipboard text. |
 | `{"sleep":600}` | Waits; the main loop keeps running. Never use it to wait for state. |
 
 A click holds the button 100 ms; a double click's two clicks are 90 ms apart,
@@ -195,6 +197,7 @@ These run in the runner (`drive` in `tests/qa/drive.rs`), between process comman
 | `{"portal_response":{"done":true,"status":0,"names":[...],"paths":[...],"keep":"output","png":{...},"discard":true},"timeout_ms":20000,"message":"..."}` | Waits for the answer and checks its status, chosen names (a set) or paths (in order); `keep` notes the first path, `png` checks it as the `fs` `png` check does, `discard` removes its download directory. |
 | `{"http":"<base64>","as":"url"}`, `{"http_requests":1,"message":"..."}` | Serves the bytes as `image/png` to every GET on 127.0.0.1 until the final state is read, its URL noted; asserts how many requests came. |
 | `{"foreign":{"paths":["$fixture/a"],"move_only":true},"as":"foreign","message":"..."}` | Starts a separate GTK drag source offering the paths (needs `session_bus`) and keeps its button's box as a `kept` target. |
+| `{"foreign":{"offers":[{"mime":"text/plain;charset=utf-8","path":"$environment/text"}]},"as":"foreign"}` | The drag source also, or instead, offers each file's bytes as they are under its MIME type, as a browser offers images, text, and addresses. |
 | `{"foreign_label":"Foreign drag finished","message":"..."}`, `{"foreign_stop":true}` | Waits for the drag source to show a label; stops it. |
 | `{"zipcrypto":{"path":"password.zip","password":"zipsecret","member":"some.txt","contents":"...","deflated":true},"as":"collision"}` | Writes a ZipCrypto archive with a random header and notes the first numeric password below 4096 that also passes the header check. `contents` may be `{"repeat":"text","count":64}`. |
 
@@ -269,7 +272,13 @@ origin (which covers popovers), looked up for up to 15 s, and the pointer aims
 only once its box comes through a painted frame unchanged: a row a listing has
 just added or replaced can report a box before its first allocation lands. A
 lookup that breaks, such as an unrealized surface, is an error, never
-`absent`.
+`absent`. When a scroller clips the aimed point (a row in a Columns pane the
+strip scrolled away, a crumb past either end of the trail, a row below a list's
+viewport), `click`, `move`, and `select` first turn the wheel over that
+scroller, with Shift for a horizontal one, until the point shows; an aim kept
+inside a `left_bound` box is not moved. That wheel is real input, so the app's
+scroll handlers run first: a pending new-entry editor is cancelled before the
+click lands.
 
 | Target | Finds |
 | --- | --- |
@@ -502,8 +511,9 @@ A failed run, or every run with `STRATA_QA_KEEP_ARTIFACTS=1`, writes
 | `transcript.jsonl` | `{"command":..., "reply":...}` per step, starting with the `{"launch":true}` reply (and one per restart): the `app` snapshot after every step. |
 | `tree.txt` | The widget tree: `Type role="..." name="..." description="..." (x,y wxh)`, headed by `focus: ...` (marked when focus sits on an unmapped widget). |
 | `state.json` | The snapshot after the last step, once two reads 250 ms apart agree (at most 5 s). |
-| `screenshot.png` | The X root at the end. |
-| `strata.log`, `xvfb.log` | The app's log and the X server's. |
+| `screenshot.png` | The X root at the end (the sway output under `STRATA_QA_DISPLAY=wayland`). |
+| `strata.log`, `xvfb.log` | The app's log and the X server's (`sway.log` under Wayland). |
+| `fcitx5.log` | With `input_method`: the input method's log. |
 | `input.log` | Every synthetic event, as above. |
 | `fixture.txt` | The fixture listing with sizes and link targets. |
 | `<name>.png`, `<name>.actual.png`, ... | `screenshot` and `baseline` captures. |

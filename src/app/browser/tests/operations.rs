@@ -12,12 +12,14 @@ fn deleted_trash_entries_refresh_the_trash_root() {
         kind: EntryKind::File,
         size: MetadataValue::Known(10),
         modified_unix_seconds: MetadataValue::Unknown,
+        created_unix_seconds: MetadataValue::Unknown,
         recent_unix_seconds: MetadataValue::Unknown,
         is_hidden: false,
         mode: MetadataValue::Unknown,
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
         recent_uri: None,
     };
 
@@ -768,12 +770,14 @@ fn cancelling_extraction_keeps_progress_until_the_worker_reports_cancellation() 
         kind: EntryKind::File,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
+        created_unix_seconds: MetadataValue::Unknown,
         recent_unix_seconds: MetadataValue::Unknown,
         is_hidden: false,
         mode: MetadataValue::Unknown,
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
         recent_uri: None,
     };
     browser.extract(entry, Location::local("/fixture"), false, None);
@@ -1003,12 +1007,14 @@ fn completed_operations_refresh_only_columns_without_a_monitor() {
                 kind: EntryKind::File,
                 size: MetadataValue::Known(1),
                 modified_unix_seconds: MetadataValue::Unknown,
+                created_unix_seconds: MetadataValue::Unknown,
                 recent_unix_seconds: MetadataValue::Unknown,
                 is_hidden: false,
                 mode: MetadataValue::Unknown,
                 image_dimensions: MetadataValue::Unknown,
                 child_count: MetadataValue::Unknown,
                 duration_seconds: MetadataValue::Unknown,
+                listable: MetadataValue::Unknown,
                 recent_uri: None,
             };
 

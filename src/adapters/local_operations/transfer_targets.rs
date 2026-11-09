@@ -18,12 +18,12 @@ use super::{
     fs_ops::{Entry, fs},
     mount_profile::NamePolicy,
     open_local_parent_directory, paste_targets, placement_reason, run_blocking,
-    transfer_source_name, was_cancelled,
+    target_is_within_source, transfer_source_name, was_cancelled,
 };
 use crate::{
     adapters::gio_file_for_location,
     model::Location,
-    services::{NameMode, ShownName},
+    services::{NameMode, ShownName, TransferConflict},
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -36,6 +36,34 @@ pub(crate) struct TransferTarget {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct Collision {
     pub mergeable: bool,
+    /// Both items are folders or neither is: a file and a folder never replace one another.
+    pub replaceable: bool,
+}
+
+impl Collision {
+    pub(crate) fn between(incoming_folder: bool, existing_folder: bool) -> Self {
+        Self {
+            mergeable: incoming_folder && existing_folder,
+            replaceable: incoming_folder == existing_folder,
+        }
+    }
+
+    /// A folder holding the incoming folder cannot merge it: staging what the merge overwrites
+    /// would take the incoming folder's own files, which then never arrive.
+    fn holding_incoming(self) -> Self {
+        Self {
+            mergeable: false,
+            ..self
+        }
+    }
+
+    pub(crate) fn allows(self, conflict: TransferConflict) -> bool {
+        match conflict {
+            TransferConflict::Merge => self.mergeable,
+            TransferConflict::ReplaceExisting => self.replaceable,
+            TransferConflict::KeepBoth | TransferConflict::FailIfExists => true,
+        }
+    }
 }
 
 /// Nothing collides with a link the paste leaves out, as the destination is known not to hold
@@ -64,6 +92,7 @@ pub(crate) async fn transfer_targets(
         .collect::<Vec<_>>();
     let blocking = cancellable.clone();
     let into = destination.clone();
+    let incoming = sources.clone();
     let (targets, folders, existing) = run_blocking(move || {
         let (kinds, filesystems) = item_kinds(&sources, remote, &blocking)?;
         let profile = pasted_into.profile;
@@ -130,17 +159,47 @@ pub(crate) async fn transfer_targets(
                 .collect()
         }
     };
-    Ok(targets
+    let collisions = folders
         .into_iter()
-        .zip(folders)
         .zip(existing)
-        .map(|((target, folder), existing)| TransferTarget {
-            collision: existing.map(|existing_folder| Collision {
-                mergeable: folder && existing_folder,
-            }),
-            ..target
-        })
-        .collect())
+        .map(|(folder, existing)| existing.map(|existing| Collision::between(folder, existing)))
+        .collect();
+    with_collisions((destination, incoming), targets, collisions).await
+}
+
+async fn with_collisions(
+    (destination, incoming): (gio::File, Vec<gio::File>),
+    targets: Vec<TransferTarget>,
+    collisions: Vec<Option<Collision>>,
+) -> Result<Vec<TransferTarget>, glib::Error> {
+    run_blocking(move || {
+        let holds = |name: &OsStr, item: &gio::File| {
+            target_is_within_source(&destination.child(name), item) != Some(false)
+        };
+        Ok(targets
+            .into_iter()
+            .zip(collisions)
+            .zip(&incoming)
+            .map(|((target, collision), item)| {
+                let merges_into_holder = collision.is_some_and(|met| met.mergeable)
+                    && target
+                        .name
+                        .as_ref()
+                        .is_some_and(|shown| holds(&shown.name, item));
+                TransferTarget {
+                    collision: collision.map(|met| {
+                        if merges_into_holder {
+                            met.holding_incoming()
+                        } else {
+                            met
+                        }
+                    }),
+                    ..target
+                }
+            })
+            .collect())
+    })
+    .await
 }
 
 const REMOTE_ITEM_ATTRIBUTES: &str = "standard::type,id::filesystem";

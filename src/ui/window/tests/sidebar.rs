@@ -6,7 +6,7 @@ use gtk::prelude::*;
 
 use super::super::{
     browser_for_window, build_sidebar, move_pinned_place, pin_gap_index, pin_locations_at,
-    sidebar_reorder_matches,
+    sidebar_reorder_matches, sidebar_rows::sidebar_button,
 };
 use crate::model::Location;
 use crate::test_support::gtk_test_with_env;
@@ -59,6 +59,13 @@ fn shows_label(widget: &gtk::Widget, text: &str) -> bool {
         child = current.next_sibling();
     }
     false
+}
+
+fn shows_class(widget: &gtk::Widget, class: &str) -> bool {
+    widget.is_visible()
+        && (widget.has_css_class(class)
+            || std::iter::successors(widget.first_child(), gtk::Widget::next_sibling)
+                .any(|child| shows_class(&child, class)))
 }
 
 #[test]
@@ -116,6 +123,72 @@ fn a_rejected_place_click_returns_the_highlight_to_the_open_location() {
                 !row(&network).has_css_class("active"),
                 "the rejected Network row must not stay highlighted"
             );
+            view.browser().clear_observer();
+            sidebar.disconnect();
+            window.destroy();
+        },
+    );
+}
+
+#[test]
+fn navigation_and_history_keep_only_the_current_sidebar_place_active() {
+    gtk_test_with_env(
+        "ui::window::tests::sidebar::navigation_and_history_keep_only_the_current_sidebar_place_active",
+        [("GIO_USE_VFS", "local")],
+        || {
+            let directory = tempfile::tempdir().expect("places fixture");
+            let a = Location::local(directory.path().join("a"));
+            let b = Location::local(directory.path().join("b"));
+            let child = Location::local(directory.path().join("a/child"));
+            std::fs::create_dir_all(child.native_path().expect("native child folder"))
+                .expect("child folder");
+            std::fs::create_dir(b.native_path().expect("native second folder"))
+                .expect("second folder");
+            save_pins(&[(a.clone(), "A".into()), (b.clone(), "B".into())]);
+            let view = browser_for_window();
+            let sidebar = build_sidebar(view.clone(), PreferenceManager::shared(), false);
+            let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+            content.append(&sidebar.widget);
+            content.append(&view.widget());
+            let window = gtk::Window::builder().child(&content).build();
+            window.present();
+            let click = |location: &Location| {
+                let row = sidebar
+                    .state
+                    .place_rows
+                    .borrow()
+                    .iter()
+                    .find(|(candidate, _)| candidate == location)
+                    .expect("place row")
+                    .1
+                    .clone();
+                row.emit_clicked();
+            };
+            let expect = |location: &Location| {
+                wait_until(
+                    || view.browser().active_location().as_ref() == Some(location),
+                    "navigation to commit",
+                );
+                for (candidate, row) in sidebar.state.place_rows.borrow().iter() {
+                    assert_eq!(
+                        row.has_css_class("active"),
+                        candidate == location,
+                        "current={location:?}, row={candidate:?}"
+                    );
+                }
+            };
+            click(&a);
+            expect(&a);
+            view.browser().navigate_location(child.clone(), true);
+            expect(&child);
+            view.browser().parent();
+            expect(&a);
+            click(&b);
+            expect(&b);
+            view.browser().back();
+            expect(&a);
+            view.browser().navigate_location(b.clone(), true);
+            expect(&b);
             view.browser().clear_observer();
             sidebar.disconnect();
             window.destroy();
@@ -288,6 +361,18 @@ fn an_empty_pinned_section_shows_only_while_files_are_dragged_over_the_sidebar()
             );
             sidebar.state.set_file_drag_over(false);
             assert!(!pinned_shown(), "leaving the sidebar hides it again");
+            sidebar.state.rebuild();
+            assert!(!pinned_shown(), "a rebuild without a drag keeps it hidden");
+            sidebar.state.set_rail(true);
+            sidebar.state.set_file_drag_over(true);
+            assert!(!pinned_shown(), "the rail hides the title during a drag");
+            assert!(
+                shows_class(sidebar.widget.upcast_ref(), "sidebar-pin-gap"),
+                "the rail keeps the pin drop target during a drag"
+            );
+            sidebar.state.set_file_drag_over(false);
+            sidebar.state.set_rail(false);
+            assert!(!pinned_shown(), "leaving the rail keeps it hidden");
 
             sidebar
                 .state
@@ -299,6 +384,54 @@ fn an_empty_pinned_section_shows_only_while_files_are_dragged_over_the_sidebar()
             window.destroy();
         },
     );
+}
+
+#[test]
+fn devices_item_count_ignores_the_dividers_between_drives() {
+    crate::test_support::gtk_test(
+        "ui::window::tests::sidebar::devices_item_count_ignores_the_dividers_between_drives",
+        || {
+            PreferenceManager::seed_saved_preferences_for_test();
+            let view = browser_for_window();
+            let sidebar = build_sidebar(view.clone(), PreferenceManager::shared(), false);
+            let section = sidebar.state.append_devices_section();
+            let append_row = |name| {
+                sidebar
+                    .state
+                    .append_sidebar_row(&sidebar_button(crate::assets::icons::HARD_DRIVE, name));
+            };
+            append_row("First partition");
+            append_row("Second partition");
+            sidebar.state.append_drive_separator();
+            append_row("Other drive");
+
+            assert_eq!(section.collect_rows(&sidebar.state.widget), 3);
+            view.browser().clear_observer();
+            sidebar.disconnect();
+        },
+    );
+}
+
+#[test]
+fn sidebar_trash_refuses_dropped_web_addresses() {
+    for (sources, accepted) in [
+        (vec![Location::local("/fixture/notes.txt")], true),
+        (vec![Location::uri("sftp://host.example/notes.txt")], true),
+        (vec![Location::uri("https://example.com/page")], false),
+        (
+            vec![
+                Location::local("/fixture/notes.txt"),
+                Location::uri("HTTP://example.com/image.png"),
+            ],
+            false,
+        ),
+    ] {
+        assert_eq!(
+            crate::ui::browser::BrowserView::can_trash_file_drop(&sources),
+            accepted,
+            "{sources:?}"
+        );
+    }
 }
 
 #[test]
@@ -321,6 +454,28 @@ fn sidebar_reorders_only_distinct_rows_in_the_same_section() {
             "{source} -> {target}"
         );
     }
+}
+
+#[test]
+fn network_share_locations_are_recognised_by_scheme() {
+    for (uri, share) in [
+        ("smb://server/share/", true),
+        ("SFTP://user@host/", true),
+        ("ftp://host/", true),
+        ("davs://host/remote.php/", true),
+        ("trash:///", false),
+        ("admin:///etc/", false),
+        ("mtp://phone/", false),
+    ] {
+        assert_eq!(
+            super::super::sidebar_devices::is_network_share(&Location::uri(uri)),
+            share,
+            "{uri}"
+        );
+    }
+    assert!(!super::super::sidebar_devices::is_network_share(
+        &Location::local("/run/media/disk")
+    ));
 }
 
 fn pin(path: &str, name: &str) -> (Location, String) {

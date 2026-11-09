@@ -107,6 +107,7 @@ impl TabWindow {
         state.install_actions(window);
         state.install_keys(window);
         super::super::install_modal_focus_trap(window);
+        keys::install_native_aliases(window);
         let weak = Rc::downgrade(&state);
         crate::ui::modal::set_modal_focus_fallback(
             window.upcast_ref(),
@@ -141,7 +142,8 @@ impl TabWindow {
         window.connect_unrealize(move |window| {
             PreferenceManager::shared().release_bindings_within(window);
             for tab in retained.tabs.take() {
-                tab.content.dispose();
+                retained.stack.remove(&tab.content.overlay);
+                tab.content.destroy();
             }
             for name in [
                 "search",
@@ -253,6 +255,7 @@ impl TabWindow {
         }
         tracing::debug!(location = %location.diagnostic_path(), "opening location in new tab");
         self.add(None);
+        self.await_location(&self.active_tab(), location.clone());
         super::super::open_argument::route_location(self.active_browser(), location);
     }
 
@@ -294,9 +297,7 @@ impl TabWindow {
         let weak = Rc::downgrade(self);
         content.browser.observe_tab_location(move |location| {
             if let Some(state) = weak.upgrade() {
-                let label = tab_label(location);
-                state.strip.label(id, &label);
-                state.set_folder(id, location.map(|_| label));
+                state.relabel(id, location);
                 state.persist_session();
             }
         });
@@ -325,8 +326,18 @@ impl TabWindow {
         };
         if self.active.get() != 0 {
             let previous = self.active_tab();
-            *previous.focus.borrow_mut() =
-                gtk::prelude::RootExt::focus(&window).map(|widget| widget.downgrade());
+            // Drop focus on the strip, header or footer: a click focuses a tab
+            // button before `clicked` runs, and a restored tab is left before
+            // its listing loads, with GTK's default focus on the footer.
+            let content = &previous.content;
+            let panes = [
+                content.browser.widget(),
+                content.sidebar.widget.clone(),
+                content.preview.widget(),
+            ];
+            *previous.focus.borrow_mut() = gtk::prelude::RootExt::focus(&window)
+                .filter(|widget| panes.iter().any(|pane| widget.is_ancestor(pane)))
+                .map(|widget| widget.downgrade());
             previous.content.footer.shortcuts.cancel_chord();
             previous.content.browser.cancel_location_edit();
         }
@@ -403,11 +414,39 @@ impl TabWindow {
             self.select(next);
         }
         self.tabs.borrow_mut().retain(|tab| tab.id != id);
-        tab.content.dispose();
         self.stack.remove(&tab.content.overlay);
+        tab.content.destroy();
         self.strip.remove(id);
         self.refresh_chrome();
         self.persist_session();
+    }
+
+    /// Names a tab after its folder, or while it has none, after the location it is
+    /// waiting on or failed to open, as its pane does. A folder ends the wait.
+    fn relabel(&self, id: u64, location: Option<&Location>) {
+        let awaited = self
+            .tabs
+            .borrow()
+            .iter()
+            .find(|tab| tab.id == id)
+            .and_then(|tab| match location {
+                Some(_) => {
+                    tab.checking.take();
+                    None
+                }
+                None => tab.checking.borrow().clone(),
+            });
+        let shown = location.or(awaited.as_ref());
+        let label = tab_label(shown);
+        self.strip.label(id, &label);
+        self.set_folder(id, shown.map(|_| label));
+    }
+
+    fn await_location(&self, tab: &Tab, location: Location) {
+        tab.checking.replace(Some(location));
+        if tab.content.browser.browser().active_location().is_none() {
+            self.relabel(tab.id, None);
+        }
     }
 
     fn set_folder(&self, id: u64, folder: Option<String>) {
@@ -689,8 +728,7 @@ impl TabWindow {
             tab.content.browser.navigate_location(location);
             return;
         }
-        self.strip.label(tab.id, &tab_label(Some(&location)));
-        tab.checking.replace(Some(location.clone()));
+        self.await_location(tab, location.clone());
         let weak = Rc::downgrade(self);
         let id = tab.id;
         super::super::open_checked(&tab.content.browser.browser(), location, move || {
@@ -729,9 +767,9 @@ impl TabWindow {
             self.close(self.active.get());
         } else if press.is(TAB_REOPEN) {
             self.reopen_closed_tab();
-        } else if press.is_any(&[TAB_NEXT, TAB_NEXT_PAGE_DOWN]) {
+        } else if press.is(TAB_NEXT) {
             self.cycle(1);
-        } else if press.is_any(&[TAB_PREVIOUS, TAB_PREVIOUS_PAGE_UP]) {
+        } else if press.is(TAB_PREVIOUS) {
             self.cycle(-1);
         } else if press.is(TAB_MOVE_LEFT) {
             self.move_active_tab(-1);
@@ -779,17 +817,20 @@ pub(in crate::ui::window) fn is_tab_shortcut(press: &KeyPress) -> bool {
         TAB_REOPEN,
         TAB_NEXT,
         TAB_PREVIOUS,
-        TAB_NEXT_PAGE_DOWN,
-        TAB_PREVIOUS_PAGE_UP,
         TAB_MOVE_LEFT,
         TAB_MOVE_RIGHT,
     ]) || tab_number(press).is_some()
 }
 
 /// A tab digit, unless the key types the `+` or `−` of a text size shortcut,
-/// as the 1 key does with Shift on Swiss German.
+/// as the 1 key does with Shift on Swiss German. Only the primary enlarging
+/// key counts, so German Shift+0, which types `=`, still selects tab 10.
 fn tab_number(press: &KeyPress) -> Option<u8> {
-    if press.is_any(&[TEXT_LARGER, TEXT_SMALLER]) {
+    if TEXT_LARGER
+        .primary()
+        .is_some_and(|primary| press.is(primary))
+        || press.is(TEXT_SMALLER)
+    {
         return None;
     }
     press.digit_in(TAB_NUMBERS)
@@ -821,14 +862,5 @@ fn tab_label(location: Option<&Location>) -> String {
             .file_name()
             .map_or_else(|| "/".into(), |name| name.to_string_lossy().into_owned());
     }
-    let uri = location.uri_value().unwrap_or_default();
-    match uri {
-        "trash:///" => crate::i18n::tr("Trash"),
-        "recent:///" => crate::i18n::tr("Recent"),
-        "network:///" => crate::i18n::tr("Network"),
-        _ => gio::File::for_uri(uri).basename().map_or_else(
-            || crate::i18n::tr("Location"),
-            |name| name.to_string_lossy().into_owned(),
-        ),
-    }
+    location.display_name()
 }

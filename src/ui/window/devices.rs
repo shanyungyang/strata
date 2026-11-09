@@ -11,18 +11,6 @@ use gtk::{gio, prelude::*};
 
 use crate::adapters::MountTable;
 
-fn mounted_devices(table: &MountTable) -> Vec<PathBuf> {
-    table
-        .sources()
-        .filter(|(point, source)| {
-            source.starts_with("/dev")
-                && point.is_absolute()
-                && !gio_unix::functions::is_mount_path_system_internal(point)
-        })
-        .map(|(point, _)| point.to_owned())
-        .collect()
-}
-
 pub(super) fn block_device_from_mount_table(table: &MountTable, path: &Path) -> Option<PathBuf> {
     table
         .source_for(path)
@@ -507,6 +495,8 @@ pub(super) struct BlockCryptoHint {
     pub id_fs_usage: Option<String>,
     pub id_fs_type: Option<String>,
     pub crypto_uuid: Option<String>,
+    /// The device is, or is held by, an open dm-crypt mapping.
+    pub cleartext_open: bool,
 }
 
 impl BlockCryptoHint {
@@ -542,7 +532,13 @@ pub(super) fn is_encrypted_device(
         || block_indicates_crypto(block)
 }
 
-pub(super) fn encrypted_device_is_locked(icon_names: &[&str], has_mount: bool) -> bool {
+/// GVfs' padlock emblem wins; without it, an open mapping whose filesystem is
+/// unmounted (for example an fstab entry) still counts as unlocked.
+pub(super) fn encrypted_device_is_locked(
+    icon_names: &[&str],
+    has_mount: bool,
+    cleartext_open: bool,
+) -> bool {
     let mut padlock_locked = false;
     let mut padlock_unlocked = false;
     for name in icon_names {
@@ -557,7 +553,7 @@ pub(super) fn encrypted_device_is_locked(icon_names: &[&str], has_mount: bool) -
     } else if padlock_unlocked {
         false
     } else {
-        !has_mount
+        !has_mount && !cleartext_open
     }
 }
 
@@ -656,12 +652,29 @@ fn probe_block_crypto(unix_device: &str) -> BlockCryptoHint {
         .or_else(|| luks_uuid_from_unix_device(unix_device))
         .or_else(|| udev.as_deref().and_then(udev_crypto_uuid))
         .or_else(|| slave_crypto_uuid(&sysfs));
+    let cleartext_open =
+        dm_uuid.as_deref().is_some_and(dm_uuid_is_crypt) || holder_is_crypt_mapping(&sysfs);
     BlockCryptoHint {
         dm_uuid,
         id_fs_usage,
         id_fs_type,
         crypto_uuid,
+        cleartext_open,
     }
+}
+
+fn holder_is_crypt_mapping(sysfs: &Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(sysfs.join("holders")) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        read_trimmed(
+            Path::new("/sys/class/block")
+                .join(entry.file_name())
+                .join("dm/uuid"),
+        )
+        .is_some_and(|uuid| dm_uuid_is_crypt(&uuid))
+    })
 }
 
 // An unlocked volume exposes the filesystem UUID, not the saved passphrase's LUKS UUID.
@@ -854,15 +867,99 @@ pub(super) fn password_drive_is_orphaned(
     should_list_orphaned_password_drive(start_stop, covered)
 }
 
-pub(super) fn global_search_roots() -> Vec<PathBuf> {
-    let monitor = gio::VolumeMonitor::get();
-    let roots = monitor
+/// How Devices lists a mount from the volume monitor's mount list.
+#[derive(Clone, Copy, Debug)]
+struct MountListing {
+    shadowed: bool,
+    volume_listed: bool,
+}
+
+impl MountListing {
+    fn of(mount: &gio::Mount, volumes: &[gio::Volume]) -> Self {
+        Self {
+            shadowed: mount.is_shadowed(),
+            volume_listed: mount
+                .volume()
+                .is_some_and(|volume| volumes.contains(&volume)),
+        }
+    }
+
+    /// A listed volume's row already stands for its mount.
+    fn has_own_row(self) -> bool {
+        !self.shadowed && !self.volume_listed
+    }
+}
+
+/// A mount's root, read as `location_for_file` reads it.
+#[derive(Clone, Debug)]
+struct MountRoot {
+    native: bool,
+    path: Option<PathBuf>,
+}
+
+impl MountRoot {
+    fn of(mount: &gio::Mount) -> Self {
+        let root = mount.root();
+        Self {
+            native: root.is_native(),
+            path: root.path(),
+        }
+    }
+
+    /// GVfs FUSE mirrors of remote shares have a path but are not native.
+    fn local_path(self) -> Option<PathBuf> {
+        self.path.filter(|_| self.native)
+    }
+}
+
+/// The mounts Devices lists on their own rows: unshadowed mounts whose volume
+/// does not already have a row.
+pub(super) fn mounts_without_listed_volumes(
+    monitor: &gio::VolumeMonitor,
+    volumes: &[gio::Volume],
+) -> Vec<gio::Mount> {
+    monitor
         .mounts()
         .into_iter()
-        .filter(|mount| !mount.is_shadowed())
-        .filter_map(|mount| mount.root().path())
-        .chain(mounted_devices(&crate::adapters::mount_watch::latest()));
-    search_roots(&super::home_directory(), roots)
+        .filter(|mount| MountListing::of(mount, volumes).has_own_row())
+        .collect()
+}
+
+fn local_device_roots(
+    volume_mounts: impl IntoIterator<Item = MountRoot>,
+    other_mounts: impl IntoIterator<Item = (MountRoot, MountListing)>,
+) -> Vec<PathBuf> {
+    volume_mounts
+        .into_iter()
+        .chain(
+            other_mounts
+                .into_iter()
+                .filter(|(_, listing)| listing.has_own_row())
+                .map(|(root, _)| root),
+        )
+        .filter_map(MountRoot::local_path)
+        .collect()
+}
+
+/// Taken from the volume monitor alone, so search skips what the backend
+/// hides, such as btrfs subvolume mounts.
+fn device_mount_roots() -> Vec<PathBuf> {
+    let monitor = gio::VolumeMonitor::get();
+    let volumes = monitor.volumes();
+    let volume_mounts: Vec<_> = volumes
+        .iter()
+        .filter_map(VolumeExt::get_mount)
+        .map(|mount| MountRoot::of(&mount))
+        .collect();
+    let other_mounts = monitor
+        .mounts()
+        .into_iter()
+        .map(|mount| (MountRoot::of(&mount), MountListing::of(&mount, &volumes)));
+    local_device_roots(volume_mounts, other_mounts)
+}
+
+pub(super) fn global_search_roots() -> Vec<PathBuf> {
+    search_roots(&super::home_directory(), device_mount_roots())
 }
 
 fn search_roots(home: &Path, mounts: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {

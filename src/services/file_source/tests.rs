@@ -10,6 +10,7 @@ fn error_details_continue_in_lower_case_only_where_the_language_does() {
     for (locale, reason, expected) in [
         ("fr", "Délai dépassé", "délai dépassé"),
         ("ru", "Доступ запрещён", "доступ запрещён"),
+        ("hu", "Hozzáférés megtagadva", "hozzáférés megtagadva"),
         (
             "vi",
             "Quyền truy cập bị từ chối",
@@ -30,6 +31,7 @@ fn io_errors_without_a_stable_kind_or_known_reason_get_catalog_text() {
         (libc::ENXIO, "The device is not available"),
         (libc::ENOTCONN, "The location is no longer connected"),
         (libc::ETXTBSY, "The file is running and cannot be changed"),
+        (libc::EXDEV, "The destination is on a different file system"),
         (libc::EPROTO, "An unexpected system error occurred"),
     ] {
         let error = std::io::Error::from_raw_os_error(errno);
@@ -37,6 +39,49 @@ fn io_errors_without_a_stable_kind_or_known_reason_get_catalog_text() {
     }
     let custom = std::io::Error::new(std::io::ErrorKind::InvalidData, "broken stream");
     assert_eq!(io_error_message(&custom), "broken stream");
+}
+
+#[test]
+fn untyped_gio_failures_use_localized_catalog_text_instead_of_backend_details() {
+    crate::test_support::gtk_test(
+        "services::file_source::tests::untyped_gio_failures_use_localized_catalog_text_instead_of_backend_details",
+        || {
+            rust_i18n::set_locale("fr");
+            let raw = "Failed to open sftp://alice:secret@host/private?token=hidden";
+            for kind in [
+                gtk::gio::IOErrorEnum::Failed,
+                gtk::gio::IOErrorEnum::InvalidArgument,
+            ] {
+                let error = gtk::glib::Error::new(kind, raw);
+                assert_eq!(
+                    super::gio_backend_error_message(&error),
+                    crate::i18n::tr(super::UNEXPECTED_SYSTEM_ERROR)
+                );
+                assert_eq!(
+                    super::gio_error_message(&error),
+                    raw,
+                    "application-owned operation errors must retain their detail"
+                );
+            }
+            let denied = gtk::glib::Error::new(gtk::gio::IOErrorEnum::PermissionDenied, raw);
+            assert_eq!(super::gio_error_message(&denied), "Permission refusée");
+            assert_eq!(
+                super::gio_backend_error_message(&denied),
+                "Permission refusée"
+            );
+            let refused = "Failed to mount Windows share: Permission denied";
+            let refused = gtk::glib::Error::new(gtk::gio::IOErrorEnum::Failed, refused);
+            assert_eq!(
+                super::gio_backend_error_message(&refused),
+                "Permission refusée",
+                "untyped SMB credential rejections keep their reason"
+            );
+            assert_eq!(
+                super::gio_error_message(&refused),
+                "Failed to mount Windows share: Permission denied"
+            );
+        },
+    );
 }
 
 #[test]
@@ -129,6 +174,21 @@ fn sanitized_uris_keep_gio_percent_encoding() {
             "{uri:?}"
         );
     }
+}
+
+#[test]
+fn non_ascii_hosts_are_preserved_verbatim() {
+    // MTP device names may contain non-ASCII characters ("一加" below): GUri
+    // re-serialization IDNA-encodes the host (mtp://OnePlus_一加_... becomes
+    // mtp://xn--...), which the gvfs backend cannot match to its device name,
+    // so the location stays permanently NotMounted.
+    assert_eq!(
+        sanitize_uri_credentials("mtp://OnePlus_%E4%B8%80%E5%8A%A0_Ace_5_Pro_9d231cfe/"),
+        Ok((
+            "mtp://OnePlus_%E4%B8%80%E5%8A%A0_Ace_5_Pro_9d231cfe/".to_owned(),
+            None
+        )),
+    );
 }
 
 #[test]

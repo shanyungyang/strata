@@ -71,12 +71,10 @@ impl Header {
         }
         let location = browser.location_widget();
         location.set_hexpand(true);
-        let search_label = crate::ui::shortcut_reference::with_keys(
-            "Search (%{keys})",
-            crate::ui::keys::Keys::One(crate::ui::keys::bindings::SEARCH),
-        );
-        let search = header_action(icons::SEARCH, &search_label);
-        crate::ui::accessibility::set_label(&search, &search_label);
+        let search = header_action(icons::SEARCH, "");
+        let search_keys = crate::ui::keys::Keys::One(crate::ui::keys::bindings::SEARCH.shown());
+        crate::ui::shortcut_reference::follow_tooltip(&search, "Search (%{keys})", search_keys);
+        crate::ui::shortcut_reference::follow_label(&search, "Search (%{keys})", search_keys);
         crate::ui::tenxer_mode::hide_while_enabled(&search);
         let appearance =
             build_appearance_menu(browser, &browser.browser(), preferences.clone(), preview);
@@ -127,12 +125,11 @@ impl Header {
         }
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 0);
         actions.add_css_class("header-actions");
-        let new_tab = header_action(
-            icons::PLUS,
-            &crate::ui::shortcut_reference::with_keys(
-                "New tab (%{keys})",
-                crate::ui::keys::Keys::One(crate::ui::keys::bindings::TAB_NEW),
-            ),
+        let new_tab = header_action(icons::PLUS, "");
+        crate::ui::shortcut_reference::follow_tooltip(
+            &new_tab,
+            "New tab (%{keys})",
+            crate::ui::keys::Keys::One(crate::ui::keys::bindings::TAB_NEW.shown()),
         );
         crate::ui::accessibility::set_label(&new_tab, &crate::i18n::tr("New tab"));
         actions.append(&new_tab);
@@ -222,8 +219,6 @@ pub(super) fn browser_layout(
     let root = gtk::Box::new(gtk::Orientation::Vertical, 0);
     root.append(&header.widget);
     bind_pin_handlers(browser, sidebar);
-    let preview_for_print = preview.clone();
-    browser.set_print_handler(Rc::new(move |entry| preview_for_print.print_entry(entry)));
     let content = browser_split(
         browser,
         sidebar,
@@ -258,9 +253,11 @@ fn bind_pin_handlers(browser: &BrowserView, sidebar: &SidebarView) {
     let weak_unpin_sidebar = Rc::downgrade(&sidebar.state);
     let pinned_places = sidebar.state.pinned_places.clone();
     browser.set_pin_handlers(
-        Rc::new(move |location, name| {
+        Rc::new(move |location, name, done| {
             if let Some(sidebar) = weak_pin_sidebar.upgrade() {
-                sidebar.pin_location(location, name);
+                sidebar.pin_location_with(location, name, done);
+            } else {
+                done(false);
             }
         }),
         Rc::new(move |location| {
@@ -320,13 +317,15 @@ fn bind_sidebar_modes(
         },
     );
     let state = Rc::downgrade(&sidebar.state);
-    let stepping_toggle = toggle.clone();
+    // The toggle owns the step, so capturing it strongly would keep a closed
+    // tab's header alive.
+    let stepping_toggle = toggle.downgrade();
     let stepping_preferences = preferences.clone();
     toggle.set_step(move || {
-        let Some(state) = state.upgrade() else {
+        let (Some(state), Some(toggle)) = (state.upgrade(), stepping_toggle.upgrade()) else {
             return;
         };
-        let mode = SidebarMode::of(stepping_toggle.is_active(), state.rail.get());
+        let mode = SidebarMode::of(toggle.is_active(), state.rail.get());
         match mode.next() {
             SidebarMode::Expanded => {
                 state.set_compact(false);
@@ -338,15 +337,11 @@ fn bind_sidebar_modes(
         }
     });
     let describe = {
-        let toggle = toggle.clone();
+        let toggle = toggle.downgrade();
         let state = Rc::downgrade(&sidebar.state);
-        let preferences = preferences.clone();
         Rc::new(move || {
-            if let Some(state) = state.upgrade() {
-                toggle.describe(
-                    SidebarMode::of(toggle.is_active(), state.rail.get()),
-                    preferences.tenxer_mode(),
-                );
+            if let (Some(toggle), Some(state)) = (toggle.upgrade(), state.upgrade()) {
+                toggle.describe(SidebarMode::of(toggle.is_active(), state.rail.get()));
             }
         })
     };
@@ -354,7 +349,7 @@ fn bind_sidebar_modes(
     toggle.connect_toggled(move |_| on_toggled());
     let on_rail = describe.clone();
     sidebar.state.connect_rail_changed(move |_| on_rail());
-    preferences.bind_preference(toggle, PreferenceManager::tenxer_mode, move |_, _| {
+    preferences.bind_preference(toggle, PreferenceManager::shown_keys, move |_, _| {
         describe();
     });
 }
@@ -367,11 +362,15 @@ fn bind_sidebar_toggle(
 ) {
     let generation = Rc::new(Cell::new(0));
     let animating = Rc::new(Cell::new(false));
-    let constrained_toggle = toggle.clone();
+    let constrained_toggle = toggle.downgrade();
     let constrained_animation = animating.clone();
     let constrained_sidebar = Rc::downgrade(&sidebar.state);
     content.connect_position_notify(move |content| {
-        if !constrained_toggle.is_active() || constrained_animation.get() {
+        if !constrained_toggle
+            .upgrade()
+            .is_some_and(|toggle| toggle.is_active())
+            || constrained_animation.get()
+        {
             return;
         }
         let Some(state) = constrained_sidebar.upgrade() else {
@@ -393,15 +392,17 @@ fn bind_sidebar_toggle(
             state.saved_width.set(Some(content.position()));
         }
     });
-    let content = content.clone();
-    let sidebar_widget = sidebar.widget.clone();
+    let toggled_content = content.downgrade();
+    let toggled_sidebar_widget = sidebar.widget.downgrade();
     let toggled_sidebar = Rc::downgrade(&sidebar.state);
-    let initial_content = content.clone();
-    let initial_sidebar = sidebar_widget.clone();
     let toggled_preview = preview.clone();
     toggle.connect_toggled(move |toggle| {
         let open = toggle.is_active();
-        let Some(state) = toggled_sidebar.upgrade() else {
+        let (Some(content), Some(sidebar_widget), Some(state)) = (
+            toggled_content.upgrade(),
+            toggled_sidebar_widget.upgrade(),
+            toggled_sidebar.upgrade(),
+        ) else {
             return;
         };
         // The same rule the preview applies each frame, so the sidebar opens
@@ -422,9 +423,9 @@ fn bind_sidebar_toggle(
         );
     });
     if !toggle.is_active() {
-        initial_content.set_position(0);
-        initial_sidebar.set_visible(false);
-        initial_content.set_shrink_start_child(true);
+        content.set_position(0);
+        sidebar.widget.set_visible(false);
+        content.set_shrink_start_child(true);
     }
 }
 

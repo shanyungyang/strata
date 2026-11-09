@@ -12,7 +12,7 @@ use crate::{
     app::Browser,
     ui::{
         browser::BrowserView,
-        keys::{SHORTCUT_MODIFIERS, bindings::*},
+        keys::{Map, SHORTCUT_MODIFIERS, bindings::*},
         window::{
             apply_browser_mode, browser_mode_for_digit, is_browser_navigation_key,
             type_to_search_query,
@@ -45,7 +45,7 @@ impl Dispatcher {
         }
         let (action, label) = if event.press.is(SEARCH) {
             ("win.search", "global search")
-        } else if event.press.is(JUMP_TO_FOLDER) {
+        } else if event.press.is(JUMP_TO_FOLDER.in_map(Map::Default)) {
             ("win.jump-folder", "folder jump")
         } else {
             return None;
@@ -57,7 +57,8 @@ impl Dispatcher {
     }
 
     pub(super) fn inline_editing(&self, event: &KeyEvent) -> KeyResult {
-        if event.press.is_any(&[RENAME, RENAME_R])
+        if event.press.is(RENAME.in_map(Map::Default))
+            && !self.preview_has_focus(event)
             && (self.view.filter_has_focus()
                 || !event
                     .focused
@@ -85,7 +86,7 @@ impl Dispatcher {
     }
 
     pub(super) fn filter_and_location_commands(&self, event: &KeyEvent) -> KeyResult {
-        if event.press.is(SPACE)
+        if event.press.is(PREVIEW.in_map(Map::Default))
             && let Some(entry) = self.view.search_result_for_space()
         {
             if self.view.activate_directory_on_space() {
@@ -97,10 +98,12 @@ impl Dispatcher {
             );
             return Some(Propagation::Stop);
         }
-        if event.press.is(ESCAPE_ANY) && self.view.dismiss_focused_filter() {
+        if event.press.is(ESCAPE_ANY)
+            && (self.view.dismiss_focused_filter() || self.dismiss_direct_search(event))
+        {
             return Some(Propagation::Stop);
         }
-        if event.press.is(FILTER) && self.view.show_filter() {
+        if event.press.is(FILTER.in_map(Map::Default)) && self.view.show_filter() {
             return Some(Propagation::Stop);
         }
         if event.press.is(LOCATION) {
@@ -152,10 +155,7 @@ impl Dispatcher {
             }
             return Some(Propagation::Stop);
         }
-        if event
-            .press
-            .is(if tenxer { TENXER_SIDEBAR } else { SIDEBAR })
-        {
+        if event.press.is(SIDEBAR) {
             toggle.emit_clicked();
             return Some(Propagation::Stop);
         }
@@ -179,10 +179,7 @@ impl Dispatcher {
         if !event.text_has_focus() && event.press.is(UNDO) && self.view.undo_last_operation() {
             return Some(Propagation::Stop);
         }
-        if !event.text_has_focus()
-            && event.press.is_any(&[REDO, REDO_Y])
-            && self.view.redo_last_operation()
-        {
+        if !event.text_has_focus() && event.press.is(REDO) && self.view.redo_last_operation() {
             return Some(Propagation::Stop);
         }
         if self.view.item_view_has_focus()
@@ -214,7 +211,7 @@ impl Dispatcher {
             self.view.create_new_folder();
             return Some(Propagation::Stop);
         }
-        if event.press.is(NEW_FOLDER_WITH_SELECTION) {
+        if event.press.is(NEW_FOLDER_WITH_SELECTION) && !self.preview_has_focus(event) {
             if !self.view.create_new_folder_for_selection() {
                 self.view.create_new_folder();
             }
@@ -233,7 +230,7 @@ impl Dispatcher {
             }
         } else if press.is(COPY) {
             BrowserView::copy_selection
-        } else if press.is(DUPLICATE) {
+        } else if press.is(DUPLICATE.in_map(Map::Default)) {
             BrowserView::duplicate_selection
         } else if press.is(CUT) {
             BrowserView::cut_selection
@@ -245,26 +242,31 @@ impl Dispatcher {
         } else {
             return None;
         };
-        if self.view.filter_has_focus()
-            || event.text_has_focus()
-            || (self.preview_has_focus(event) && press.is_any(&[SELECT_ALL, COPY, PASTE, CUT]))
-        {
+        if self.view.filter_has_focus() || event.text_has_focus() || self.preview_has_focus(event) {
             return Some(Propagation::Proceed);
         }
         action(&self.view).then_some(Propagation::Stop)
     }
 
-    fn preview_has_focus(&self, event: &KeyEvent) -> bool {
-        let preview = self.preview.widget();
-        event
-            .focused
-            .as_ref()
-            .is_some_and(|focused| focused == &preview || focused.is_ancestor(&preview))
+    /// Whether keyboard focus is anywhere inside the preview drawer, whatever
+    /// widget it renders.
+    pub(super) fn preview_has_focus(&self, event: &KeyEvent) -> bool {
+        self.preview.owns_focus(event.focused.as_ref())
     }
 
     pub(super) fn context_menu_command(&self, event: &KeyEvent) -> KeyResult {
-        if event.press.is_any(&[CONTEXT_MENU, CONTEXT_MENU_F10])
-            && !event.text_has_focus()
+        if !event.press.is(CONTEXT_MENU) {
+            return None;
+        }
+        // A focused Back button lists its history for this key itself.
+        if event
+            .focused
+            .as_ref()
+            .is_some_and(crate::ui::browser::lists_back_history)
+        {
+            return Some(Propagation::Proceed);
+        }
+        if !event.text_has_focus()
             && (super::sidebar::open_sidebar_context_menu(&self.sidebar.widget)
                 || self.view.open_focused_context_menu())
         {
@@ -274,7 +276,7 @@ impl Dispatcher {
     }
 
     fn browser_commands(&self, browser: &Rc<Browser>, event: &KeyEvent) -> KeyResult {
-        if event.press.is_any(&[HIDDEN_FILES, HIDDEN_FILES_PERIOD]) {
+        if event.press.is(HIDDEN_FILES.in_map(Map::Default)) {
             browser.toggle_hidden();
         } else if event.press.is(TERMINAL) {
             self.view.open_terminal();

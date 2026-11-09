@@ -454,6 +454,9 @@ fn message(check: &Check) -> String {
         Finding::LandlockUnavailable => tr(
             "The kernel doesn't support Landlock ABI 3, so each thumbnail starts its own sandbox and loads more slowly.",
         ),
+        Finding::NamespacesRestricted => tr(
+            "The system blocks nested user namespaces, for example through AppArmor, so each thumbnail starts its own sandbox and loads more slowly.",
+        ),
         Finding::WorkersFailed => tr("A sandboxed worker couldn't render a sample image."),
         Finding::SampleProcessed => tr("A sample file was processed correctly."),
         Finding::SampleFailed => tr("A sample file couldn't be processed."),
@@ -578,6 +581,9 @@ fn environment(anchor: &impl IsA<gtk::Widget>) -> Vec<(String, String)> {
     let tr = crate::i18n::tr;
     let installation = match InstallSource::detect().managed() {
         Some(managed) => managed.ownership_summary(),
+        None if !crate::build_info::updater_enabled() => {
+            tr("In-app updates are disabled in this build.")
+        }
         None => tr("Self-managed"),
     };
     let kernel = ["ostype", "osrelease"]

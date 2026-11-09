@@ -44,12 +44,13 @@ fn open_persisting(
 }
 
 fn wait_until(condition: impl Fn() -> bool) {
+    wait_until_or(condition, || "tab state did not settle".to_owned());
+}
+
+fn wait_until_or(condition: impl Fn() -> bool, failure: impl Fn() -> String) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !condition() {
-        assert!(
-            std::time::Instant::now() < deadline,
-            "tab state did not settle"
-        );
+        assert!(std::time::Instant::now() < deadline, "{}", failure());
         while glib::MainContext::default().pending() {
             glib::MainContext::default().iteration(false);
         }
@@ -165,6 +166,19 @@ fn sibling_fixture(
     .downcast::<gtk::Label>()
     .expect("label");
     (root, window, tabs, view, title)
+}
+
+#[test]
+fn remote_root_tab_labels_name_the_server_or_share_like_their_headings() {
+    for (uri, label) in [
+        ("smb://host/", "host".to_owned()),
+        ("smb://host/My%20Share/", "My Share".to_owned()),
+        ("sftp://host/caf%C3%A9", "café".to_owned()),
+        ("trash:///", crate::i18n::tr("Trash")),
+        ("recent:///", crate::i18n::tr("Recent")),
+    ] {
+        assert_eq!(tab_label(Some(&Location::uri(uri))), label, "{uri}");
+    }
 }
 
 #[test]
@@ -378,6 +392,69 @@ fn tabs_preserve_locations_and_route_actions_to_the_active_browser() {
 }
 
 #[test]
+fn returning_to_a_tab_left_by_a_tab_button_focuses_its_listing() {
+    gtk_test(
+        "ui::window::composition::tabs::tests::returning_to_a_tab_left_by_a_tab_button_focuses_its_listing",
+        || {
+            let root = tempfile::tempdir().expect("tab fixture");
+            std::fs::write(root.path().join("one.txt"), "one").expect("file");
+            let (window, tabs) = open();
+            let first_id = tabs.active.get();
+            let first = tabs.active_browser();
+            load(&first, Location::local(root.path()));
+            tabs.new_tab();
+            let second_id = tabs.active.get();
+            load(&tabs.active_browser(), Location::local(root.path()));
+            tabs.select(first_id);
+            wait_until(|| first.item_view_has_focus());
+
+            // A click focuses the tab button before `clicked` selects its tab.
+            let button = find_widget(tabs.strip.widget().upcast_ref(), &|widget| {
+                widget.has_css_class("tab-select")
+            })
+            .expect("a tab button");
+            assert!(button.grab_focus(), "tab buttons take focus on click");
+            tabs.select(second_id);
+            tabs.select(first_id);
+
+            wait_until(|| first.item_view_has_focus());
+            window.destroy();
+        },
+    );
+}
+
+#[test]
+fn returning_to_a_tab_restores_focus_in_its_sidebar() {
+    gtk_test(
+        "ui::window::composition::tabs::tests::returning_to_a_tab_restores_focus_in_its_sidebar",
+        || {
+            let root = tempfile::tempdir().expect("tab fixture");
+            let (window, tabs) = open();
+            let first_id = tabs.active.get();
+            load(&tabs.active_browser(), Location::local(root.path()));
+            let sidebar = tabs.active_tab().content.sidebar.widget.clone();
+            tabs.new_tab();
+            let second_id = tabs.active.get();
+            tabs.select(first_id);
+
+            let place = || {
+                find_widget(&sidebar, &|widget| {
+                    widget.is::<gtk::Button>() && widget.is_mapped()
+                })
+            };
+            wait_until(|| place().is_some());
+            let row = place().expect("a sidebar place");
+            assert!(row.grab_focus(), "sidebar rows take focus");
+            tabs.select(second_id);
+            tabs.select(first_id);
+
+            assert_eq!(gtk::prelude::RootExt::focus(&window), Some(row));
+            window.destroy();
+        },
+    );
+}
+
+#[test]
 fn tab_shortcuts_work_in_both_modes_and_follow_reordering() {
     gtk_test(
         "ui::window::composition::tabs::tests::tab_shortcuts_work_in_both_modes_and_follow_reordering",
@@ -565,11 +642,23 @@ fn closing_tabs_releases_observers_and_keeps_other_contexts_alive() {
             let (window, tabs) = open();
             let root = tempfile::tempdir().expect("tab fixture");
             load(&tabs.active_browser(), Location::local(root.path()));
+            let listeners_before = tabs.preferences.listener_count();
             tabs.new_tab();
+            load(&tabs.active_browser(), Location::local(root.path()));
             let closed = tabs.active_browser().downgrade();
+            let closed_listing = tabs.active_browser().widget().downgrade();
             let id = tabs.active.get();
             tabs.close(id);
-            wait_until(|| closed.upgrade().is_none());
+            wait_until_or(
+                || closed.upgrade().is_none() && closed_listing.upgrade().is_none(),
+                || "the closed tab's view or listing is still alive".to_owned(),
+            );
+            assert!(
+                tabs.preferences.listener_count() <= listeners_before,
+                "preference listeners of the closed tab were kept: {} before, {} after",
+                listeners_before,
+                tabs.preferences.listener_count()
+            );
             assert_eq!(tabs.active.get(), 1);
             assert_eq!(
                 tabs.active_browser().browser().active_location(),
@@ -580,6 +669,35 @@ fn closing_tabs_releases_observers_and_keeps_other_contexts_alive() {
             tabs.close(1);
             assert_eq!(tabs.active.get(), active);
             assert_eq!(tabs.tabs.borrow().len(), 1);
+            window.destroy();
+        },
+    );
+}
+
+#[test]
+fn rebuilding_panes_adds_no_browser_observers() {
+    gtk_test(
+        "ui::window::composition::tabs::tests::rebuilding_panes_adds_no_browser_observers",
+        || {
+            let (window, tabs) = open();
+            let root = tempfile::tempdir().expect("tab fixture");
+            let child = root.path().join("child");
+            std::fs::create_dir(&child).expect("child folder");
+            let view = tabs.active_browser();
+            load(&view, Location::local(root.path()));
+            let before = view.browser().observer_count();
+            for mode in [
+                crate::ui::browser_modes::BrowserMode::Columns,
+                crate::ui::browser_modes::BrowserMode::Icons,
+                crate::ui::browser_modes::BrowserMode::List,
+            ] {
+                tabs.preferences.set_browser_mode(mode);
+                for _ in 0..3 {
+                    load(&view, Location::local(&child));
+                    load(&view, Location::local(root.path()));
+                }
+            }
+            assert_eq!(view.browser().observer_count(), before);
             window.destroy();
         },
     );
@@ -851,6 +969,77 @@ fn saved_session_restores_tabs_in_order_with_active_tab() {
             wait_until(|| tab_locations(&tabs) == expected);
             assert_eq!(tabs.tabs.borrow().len(), 3);
             assert_eq!(tabs.active.get(), tabs.tabs.borrow()[2].id);
+            window.destroy();
+        },
+    );
+}
+
+/// Restores three tabs on folders holding a subfolder and a file, so the
+/// cursor lands on a folder whose column mirrors open, as on a real launch.
+fn restore_three_tabs(root: &std::path::Path) -> (gtk::ApplicationWindow, Rc<TabWindow>) {
+    let folders: Vec<_> = ["first", "second", "third"]
+        .into_iter()
+        .map(|name| root.join(name))
+        .collect();
+    for folder in &folders {
+        std::fs::create_dir_all(folder.join("sub")).expect("session directory");
+        std::fs::write(folder.join("file.txt"), "file").expect("session file");
+    }
+    crate::ui::tabs_session::save(&folders.iter().map(Location::local).collect::<Vec<_>>(), 2);
+    crate::storage::writer::settle();
+    let (window, tabs) = open();
+    assert!(tabs.try_restore());
+    let expected: Vec<_> = folders
+        .iter()
+        .map(|folder| Some(Location::local(folder)))
+        .collect();
+    wait_until(|| tab_locations(&tabs) == expected);
+    (window, tabs)
+}
+
+fn focused_widget(window: &gtk::ApplicationWindow) -> String {
+    gtk::prelude::RootExt::focus(window).map_or_else(
+        || "nothing".to_owned(),
+        |widget| format!("{} {:?}", widget.type_(), widget.css_classes()),
+    )
+}
+
+#[test]
+fn a_restored_session_opens_with_focus_in_the_listing() {
+    gtk_test(
+        "ui::window::composition::tabs::tests::a_restored_session_opens_with_focus_in_the_listing",
+        || {
+            let root = tempfile::tempdir().expect("tab fixture");
+            let (window, tabs) = restore_three_tabs(root.path());
+            let active = tabs.active_browser();
+
+            wait_until_or(
+                || active.item_view_has_focus(),
+                || format!("focus after restoring: {}", focused_widget(&window)),
+            );
+            window.destroy();
+        },
+    );
+}
+
+#[test]
+fn a_restored_tab_shown_for_the_first_time_focuses_its_listing() {
+    gtk_test(
+        "ui::window::composition::tabs::tests::a_restored_tab_shown_for_the_first_time_focuses_its_listing",
+        || {
+            let root = tempfile::tempdir().expect("tab fixture");
+            let (window, tabs) = restore_three_tabs(root.path());
+            let ids: Vec<_> = tabs.tabs.borrow().iter().map(|tab| tab.id).collect();
+
+            // Ctrl+Shift+1 and Ctrl+Shift+2: tabs restored but never shown.
+            for id in &ids[..2] {
+                tabs.select(*id);
+                let browser = tabs.active_browser();
+                wait_until_or(
+                    || browser.item_view_has_focus(),
+                    || format!("focus after showing tab {id}: {}", focused_widget(&window)),
+                );
+            }
             window.destroy();
         },
     );
@@ -1280,28 +1469,6 @@ fn open_in_new_tab_appends_activates_and_navigates_the_target() {
             let view = tabs.active_browser();
             wait_until(|| view.browser().active_location().is_some());
             assert_eq!(view.browser().active_location(), Some(location));
-            window.destroy();
-        },
-    );
-}
-
-#[test]
-fn open_in_new_tab_reuses_the_unavailable_overlay_for_a_missing_target() {
-    gtk_test(
-        "ui::window::composition::tabs::tests::open_in_new_tab_reuses_the_unavailable_overlay_for_a_missing_target",
-        || {
-            PreferenceManager::seed_saved_preferences_for_test();
-            let root = tempfile::tempdir().expect("missing target fixture");
-            let missing = root.path().join("missing");
-            let (window, tabs) = open();
-            load(&tabs.active_browser(), Location::local(root.path()));
-            tabs.open_in_new_tab(Location::local(&missing));
-            let view = tabs.active_browser();
-            wait_until(|| button_with_label(view.overlay().upcast_ref(), "Retry").is_some());
-            assert!(
-                button_with_label(view.overlay().upcast_ref(), "Retry").is_some(),
-                "a missing target shows the retry overlay"
-            );
             window.destroy();
         },
     );

@@ -48,6 +48,49 @@ fn exact_names_rank_above_substrings_and_fuzzy_matches() {
 }
 
 #[test]
+fn multi_word_match_tiers_survive_long_paths_depth_and_fuzzy_bonuses() {
+    let root = Path::new("/fixture");
+    let long_parent = [
+        "a".repeat(100),
+        "b".repeat(100),
+        "c".repeat(100),
+        "d".repeat(100),
+    ]
+    .join("/");
+    for (query, stronger, weaker) in [
+        (
+            "duck txt",
+            format!("{}{}duck txt.md", "a/".repeat(63), "x".repeat(200)),
+            "duck txt archive/notes.md".to_owned(),
+        ),
+        (
+            "duck txt",
+            format!("{long_parent}/duck txt/notes.md"),
+            "ducks_in_the_pool.txt".to_owned(),
+        ),
+        (
+            "duck txt",
+            format!("{}duck{}.txt", "a/".repeat(63), "x".repeat(92)),
+            "duck/notes.txt".to_owned(),
+        ),
+        (
+            "abcdefghijklmnopqrstuvwx yzabcdefghij",
+            "abcdefghijklmnopqrstuvwx/yzabcdefghij".to_owned(),
+            "abcdefghijklmnopqrstu_vwx yzabcdefghij.md".to_owned(),
+        ),
+    ] {
+        let stronger_score = score_path(&root.join(&stronger).to_string_lossy(), query, root)
+            .expect("stronger match");
+        let weaker_score =
+            score_path(&root.join(&weaker).to_string_lossy(), query, root).expect("weaker match");
+        assert!(
+            stronger_score > weaker_score,
+            "query={query:?}: {stronger:?} ({stronger_score}) must outrank {weaker:?} ({weaker_score})",
+        );
+    }
+}
+
+#[test]
 fn cat_01_name_matches_rank_above_fuzzy_bucket_paths() {
     let root = Path::new("/fixture");
     let exact_prefix = score_path("/fixture/Cats/cat-01-photo.jpg", "cat-01", root)
@@ -120,7 +163,8 @@ fn completed_index_returns_only_the_best_bounded_matches() {
     let root = unique_fixture_root("bounded-best-matches");
     fs::create_dir_all(&root).expect("create fixture");
     fs::write(root.join("needle"), b"best match").expect("write exact match");
-    for position in 0..120 {
+    // Created last-first, so walk order disagrees with name order on any file system.
+    for position in (0..120).rev() {
         fs::write(root.join(format!("needle-{position:03}")), b"candidate")
             .expect("write candidate");
     }
@@ -139,8 +183,34 @@ fn completed_index_returns_only_the_best_bounded_matches() {
     let Some(SearchEvent::Results { items, .. }) = event else {
         panic!("the worker should publish bounded results");
     };
-    assert_eq!(items.len(), 100);
-    assert_eq!(items.first().map(|item| item.name.as_str()), Some("needle"));
+    let expected = std::iter::once("needle".to_owned())
+        .chain((0..99).map(|position| format!("needle-{position:03}")))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        items
+            .iter()
+            .map(|item| item.name.clone())
+            .collect::<Vec<_>>(),
+        expected,
+        "equal scores keep and list the first names, not the first walked"
+    );
+}
+
+#[test]
+fn appended_equal_scores_insert_in_name_order_within_the_limit() {
+    let root = Path::new("/fixture");
+    let mut matches = Vec::new();
+    for name in ["gamma", "alpha", "delta", "beta"] {
+        let item = SearchItem::new(root.join(name), root, false);
+        super::scoring::insert_match_with_limit(&mut matches, 7, &item, 3);
+    }
+    assert_eq!(
+        matches
+            .iter()
+            .map(|(_, item)| item.name.as_str())
+            .collect::<Vec<_>>(),
+        ["alpha", "beta", "delta"]
+    );
 }
 
 #[test]

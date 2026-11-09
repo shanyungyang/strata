@@ -205,9 +205,23 @@ pub(super) fn apply_collection_scroll(
     position: u32,
     flags: gtk::ListScrollFlags,
 ) {
+    let flags = if flags.contains(gtk::ListScrollFlags::FOCUS)
+        && !crate::ui::focus_navigation::browser_can_take_focus(view)
+    {
+        flags.difference(gtk::ListScrollFlags::FOCUS)
+    } else {
+        flags
+    };
     if let Ok(list) = view.clone().downcast::<gtk::ListView>() {
         if position < list.model().map_or(0, |model| model.n_items()) {
             list.scroll_to(position, flags, None);
+            // GTK scrolls to the row; the first section's heading sits above it.
+            if let Some(adjustment) = list
+                .vadjustment()
+                .filter(|_| position == 0 && list.header_factory().is_some())
+            {
+                adjustment.set_value(adjustment.lower());
+            }
         }
         return;
     }
@@ -731,12 +745,14 @@ pub(crate) fn search_result_entry(item: &crate::services::SearchItem) -> crate::
         kind: item.kind,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Unknown,
+        created_unix_seconds: MetadataValue::Unknown,
         recent_unix_seconds: MetadataValue::Unknown,
         is_hidden: false,
         mode: item.mode.clone(),
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
         recent_uri: None,
     }
 }

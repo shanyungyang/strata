@@ -26,6 +26,7 @@ pub mod icons {
     pub const CIRCLE_CHECK: &str = "strata-circle-check";
     pub const CIRCLE_X: &str = "strata-circle-x";
     pub const CHECK_ON_PRIMARY: &str = "strata-check-on-primary";
+    pub const CHEVRON_DOWN: &str = "strata-chevron-down";
     pub const CHEVRON_RIGHT: &str = "strata-chevron-right";
     pub const CLOCK: &str = "strata-clock";
     pub const CLIPBOARD_PASTE: &str = "strata-clipboard-paste";
@@ -51,6 +52,7 @@ pub mod icons {
     pub const FOLDER: &str = "strata-folder";
     pub const FOLDER_ARCHIVE: &str = "strata-folder-archive";
     pub const FOLDER_INPUT: &str = "strata-folder-input";
+    pub const FOLDER_LOCK: &str = "strata-folder-lock";
     pub const FOLDER_OPEN: &str = "strata-folder-open";
     pub const FOLDER_OUTPUT: &str = "strata-folder-output";
     pub const FOLDER_PLUS: &str = "strata-folder-plus";
@@ -75,6 +77,7 @@ pub mod icons {
     pub const LOCK_OPEN: &str = "strata-lock-open";
     pub const KEY: &str = "strata-key";
     pub const KEY_ROUND: &str = "strata-key-round";
+    pub const KEYBOARD: &str = "strata-keyboard";
     pub const MONITOR: &str = "strata-monitor";
     pub const NETWORK: &str = "strata-network";
     pub const PALETTE: &str = "strata-palette";

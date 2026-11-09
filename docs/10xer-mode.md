@@ -295,6 +295,7 @@ cursor or **v** then motion → **y** / **x** → **h** / **l** / **g h** / **g 
 | **R** | Restore the selection (or the focused item) from Trash, with confirmation |
 | **c c** / **c n** | Copy path / name |
 | **; 1**–**; 9** / **; 0** | Run the first 10 matching custom actions |
+| **; . 1**–**; . 9** / **; . 0** | Run the first 10 custom actions for the keyboard-focused folder |
 | **; t** | Open a terminal in the keyboard-focused folder |
 | **; c** | Compress the selection (or the focused item) |
 | **; e** / **; E** | Extract the archive here / to a folder typed in the footer |
@@ -314,9 +315,17 @@ and targets again: if the targets changed since **;**, it flashes
 neither runs anything. A confirming action asks first, and a run shows in Jobs
 like one started from the context menu. See [custom actions](custom-actions.md).
 
+**; .** switches the panel to the actions for the keyboard-focused folder, the
+pane holding the cursor, as its background menu offers them: the folder is the
+only input and `{parent}`, whatever the cursor or selection is on, and the run's
+source is `background`. The pill reads **; .-**, and **1**–**9** / **0** pick
+from the same slots and order, so **; . 1** runs the first folder action even
+in an empty folder. Non-local places list `No matching actions`. If the focused
+folder changes before the digit, it flashes `Folder changed` and runs nothing.
+
 **; t** opens a terminal in the keyboard-focused folder, the pane holding the
-cursor, whatever the cursor or selection is on. The panel lists it, then
-**; c**, **; e**, and **; E**, after the actions. In Trash and other non-local places it flashes
+cursor, whatever the cursor or selection is on. After the actions, the panel
+lists **; .**, this command, **; c**, **; e**, and **; E**. In Trash and other non-local places it flashes
 `Can’t open a terminal here`. **Ctrl+Alt+T** in regular mode keeps its own rule and prefers a
 single selected folder.
 
@@ -380,7 +389,8 @@ button does not choose it: nothing changes until you accept, and Cancel or
 focused; pressing **d** again confirms it, so **d d** trashes. **D** / **Shift+Delete**, and **d** inside Trash, show the permanent
 deletion confirmation with its confirm button focused, so **Enter** confirms, and **d**
 there does nothing. In a folder whose listing reports no Trash support (such as
-a tmpfs, or a FUSE mount that already refused Trash), **d** / **Delete** open a permanent confirmation instead, stating
+a tmpfs, a FUSE mount that already refused Trash, or a folder opened as
+[administrator](administrator-access.md)), **d** / **Delete** open a permanent confirmation instead, stating
 that the location doesn't support Trash, with Cancel focused, so **d d** does
 not delete there. Errors appear in
 the usual operation dialogs, and **Ctrl+Z** undoes what the default map can undo.
@@ -403,7 +413,10 @@ open-path marker. The current name is filled in with a file's stem (or a
 folder's whole name) selected, as inline rename selects it. The item is fixed
 when the prompt opens; **Up** / **Down** do not move the cursor while it is open.
 **Enter** renames the item to exactly the typed name and keeps its contents; an
-unchanged name does nothing. An invalid name, one already taken (including by
+unchanged name does nothing. In a local folder the name may be a relative path
+that moves the item, as for [inline renames](keyboard-navigation.md#creating-files-and-folders);
+a folder on the path that is already a file or link also keeps the prompt open.
+An invalid name, one already taken (including by
 another hard link to the same file; see
 [Rename](filesystem-compatibility.md#rename)), or one the location would store
 as another keeps the prompt open with the reason, and nothing is replaced.
@@ -490,6 +503,42 @@ a scheme the location bar opens such as `sftp:`, `//host`, `\\host`, or
 `user@host:`) lists nothing and is never searched,
 mounted, or probed before **Enter**.
 
+### Letter bookmarks
+
+From a file listing, press **m**, then a lowercase **a–z**, to save the
+keyboard-focused pane's current directory under that letter. Press **'**, then
+the same letter, to return there. For example, **m p** saves a directory and
+**' p** opens it later. Selecting a child folder does not change what gets saved.
+Saving another directory under the same letter replaces that bookmark.
+
+Letter bookmarks are separate from sidebar pins, shared by all windows, and
+persist across restarts in `$XDG_DATA_HOME/strata/letter-bookmarks.json`
+(default `~/.local/share/strata/letter-bookmarks.json`). Only local directories
+are supported; remote locations and virtual places cannot be saved. A missing
+bookmark or unavailable directory reports an error without navigating.
+
+The footer shows the armed prefix. The **m** menu shows one **a–z** row for
+saving; the **'** menu lists only saved letters, each beside its full directory
+path.
+With no saved bookmarks, no options menu is shown. **Esc** cancels;
+unknown or modified second keys cancel without running another command.
+After choosing a letter, the jump stays pending while its directory is checked.
+**Esc** or another command key cancels that pending jump without changing the
+listing, selection, or preview; changing the selection yourself also cancels
+it. Only a successful check navigates: missing, unreadable, unavailable, or
+timed-out folders leave the current directory intact.
+Text fields keep these keys as ordinary text, and the default keyboard map is
+unchanged. **m** and **'** can be rebound as the `bookmark_set` and
+`bookmark_go` chord triggers (see [Keymap](keymap.md)); the letters after
+them are fixed. On layouts where **'** is a dead key, such as US International
+(`us(intl)`), the key composes an accent instead of opening the menu, and the
+letter after it runs its own 10xer command; rebind `bookmark_go` to a key that
+is not dead there (see
+[Dead keys](keyboard-shortcuts.md#how-a-key-press-becomes-a-shortcut)). The
+file chooser does not save or open letter bookmarks. Document
+and archive previews swallow both bookmark prefixes. In a media preview,
+**m** still mutes; return to the listing before using bookmarks.
+
 ## Prompts
 
 Typed commands use the footer, never the pane filter revealer or the global
@@ -535,6 +584,19 @@ collapsed. While a filter is active, the footer count is the displayed result
 count, including zero, with a file/folder breakdown in its accessible description; motion,
 **Enter**, and **Ctrl+R** act on the results, never on the hidden directory's
 cursor or fill.
+
+While typing an **f** filter, **/** enters the first displayed match if it is a
+folder, even for a partial or fuzzy match. Once **Up** or **Down** has moved the
+result cursor since the query last changed, **/** enters the highlighted result
+instead. It clears the query and keeps the filter prompt focused in that folder,
+ready for the next level. For example, **f**, `doc`, **/**, `proj`, **/** can
+enter `Documents/Projects`. A file as that result, no matches, or an empty query
+leaves the prompt and location unchanged. Pending filter results wait for a
+match or indexing to finish, and a folder that is still listing waits until a
+folder matches first or the listing ends; editing or dismissing the prompt
+cancels that pending navigation. This shortcut does not apply to **s** search
+or **/** / **?** find prompts. Normal-mode **Ctrl+F** supports the same shortcut
+with its own filename matching rules, and always enters the first result.
 
 **s** always searches the current folder tree, not every indexed root, and
 matches paths below it the way fzf does: each space-separated term must match
@@ -698,9 +760,16 @@ The request takes the fill, or the cursor item when nothing is filled; the
 automatic first-row selection never counts. A Save request always saves in the
 current folder, and moving the cursor changes neither the name nor the
 destination. While the name or location field has focus, every key but **F1**,
-**Ctrl+Shift+M**, and **Esc** is typed; **Ctrl+A** selects the text. Every
-request starts with focus in the files. **Tab** goes from the files to the
-header, from the header to the Save name, and from the name back to the files.
+**Ctrl+Shift+M**, and **Esc** is typed, except that **Tab** and **Shift+Tab**
+leave the name field; **Ctrl+A** selects the text. Every request starts with
+focus in the files. **Tab** goes from the files to the header, from the header
+to the name field, then through the request's options (file type, choices the
+application offers, and **Open files read-only**) and back to the files. With
+no options, **Tab** from the name field returns straight to the files. A
+request without a name field, such as a folder chooser, goes from the header
+straight to its options.
+**Shift+Tab** steps back through the options to the name field, and from the
+name field returns to the files.
 Saving over an existing file asks first with Cancel focused. Beside Cancel and
 Save, a Save request shows hints for **Enter**, plus **r** and **o** when it
 saves one named file.
@@ -732,8 +801,6 @@ shows no hint. Default-map hints that are unbound or remapped (**y** for copy pa
 **Ctrl+R** for rename) are hidden. Copy path is **c c**; Properties is
 **Alt+Enter**.
 
-## Not bound
-
 Tabs use the same shortcuts in both modes: **Ctrl+T** creates a tab,
 **Ctrl+W** closes it, **Ctrl+Shift+T** reopens the last closed tab,
 **Ctrl+Tab / Ctrl+Shift+Tab** cycles tabs, and
@@ -744,16 +811,12 @@ stopping at either end of the strip.
 **Ctrl+Shift+1–9 / 0** selects a tab directly. Hold **Ctrl+Shift** to show tab
 numbers. See [browser tabs](keyboard-navigation.md#browser-tabs).
 
-These default-map shortcuts are unbound or remapped while the mode is on:
+## Not bound
 
-| Default-map key | In 10xer mode |
-| --- | --- |
-| **Ctrl+Shift+K** | Unbound. Use **z** / **Z**. |
-| **Ctrl+Alt+T** | Unbound. Use **;** **t** or the context menu. |
-| **Ctrl+\\** | Unbound. Arrows never leave the file list. |
-| **Ctrl+D** | Half page down. Duplicate is dropped. |
-| **Ctrl+F** | Full page down. Filter is **f**. |
-| **Ctrl+B** | Full page up. Sidebar toggle is **Ctrl+N**. |
-| **Ctrl+R** | Invert selection. Rename is **r** / **F2**. |
-| **y** / **p** (default map) | Yank / paste. Path copy is **c c**; pin with **g +** and jump to a pin with **g** then a digit. |
-| **Space** | Toggle selection. In List and Columns, preview is **l** / **→**. |
+Some default-map keys do something else in 10xer mode or nothing at all: for
+example, **Ctrl+R** inverts the selection there, and rename is **r** / **F2**.
+**Settings → Keyboard** shows both tables as they are, with any changes: switch
+it to **10xer mode** to see each action's 10xer keys and **Not bound** on the
+ones 10xer leaves out. Each table lists only the actions its mode can run. A key bound in the 10xer table to jump to folder, arrow
+scope, duplicate or pin works there, and the default table can bind several
+10xer verbs; see [Keymap](keymap.md#two-tables).

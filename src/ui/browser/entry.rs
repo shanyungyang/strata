@@ -4,14 +4,10 @@ use crate::adapters::directory_summary::{DirectorySummary, summarize_directory};
 use crate::adapters::gio_file_for_location;
 use crate::assets::icons;
 use crate::model::{EntryKind, FileEntry, MetadataValue};
-use crate::services::{
-    PathMatcher, PathQuery, PreviewContent, content_family, filter_name_matches, fold_for_search,
-    has_plain_text_extension, is_extensionless_dotfile,
-};
+use crate::services::{PathMatcher, PathQuery, filter_name_matches, fold_for_search};
+use gtk::glib;
 use gtk::prelude::*;
-use gtk::{gio, glib};
 use std::cell::{Cell, RefCell};
-use std::path::Path;
 use std::rc::Rc;
 
 thread_local! {
@@ -25,33 +21,15 @@ pub(in crate::ui) fn format_file_size(bytes: u64) -> String {
 pub(in crate::ui) fn metadata_needs_fill(entry: &FileEntry) -> bool {
     entry.modified_unix_seconds == crate::model::MetadataValue::Unknown
         || (!entry.is_directory() && entry.size == crate::model::MetadataValue::Unknown)
+        || (entry.is_directory()
+            && entry.location.native_path().is_some()
+            && entry.listable == crate::model::MetadataValue::Unknown)
 }
 
 pub(super) fn entry_responds_to_preview_click(entry: &FileEntry, previews_enabled: bool) -> bool {
     previews_enabled
         && !entry.is_directory()
         && crate::ui::preview::entry_supports_quick_preview(entry)
-}
-
-pub(super) fn entry_supports_printing(entry: &FileEntry) -> bool {
-    if !matches!(entry.kind, EntryKind::File | EntryKind::FileSymbolicLink) {
-        return false;
-    }
-
-    let native_path = entry.location.native_path();
-    let (content_type, uncertain) =
-        gio::content_type_guess(Some(Path::new(&entry.native_name)), None::<&[u8]>);
-    // An uncertain name guess defers to the loader, which resolves the file's content type.
-    matches!(content_family(&content_type), PreviewContent::Text { .. })
-        || (uncertain && matches!(content_family(&content_type), PreviewContent::Unsupported))
-        || (native_path.is_some()
-            && matches!(
-                content_family(&content_type),
-                PreviewContent::Image | PreviewContent::Pdf { .. }
-            ))
-        || gio::content_type_is_a(&content_type, "text/plain")
-        || has_plain_text_extension(&entry.native_name)
-        || is_extensionless_dotfile(&entry.native_name)
 }
 
 pub(in crate::ui) fn entry_model_value(entry: &FileEntry) -> String {
@@ -91,9 +69,6 @@ pub(in crate::ui) fn model_is_hidden(value: &str) -> bool {
     value.as_bytes().get(1) == Some(&b'h')
 }
 
-pub(in crate::ui) const FOLDER_TYPE_GROUP: &str = crate::services::FOLDER_TYPE_NAME;
-pub(in crate::ui) const OTHER_TYPE_GROUP: &str = crate::services::OTHER_TYPE_NAME;
-
 /// Empty for a value without a group, such as an empty model value.
 pub(in crate::ui) fn model_type_group(value: &str) -> &str {
     value
@@ -118,6 +93,9 @@ pub(in crate::ui) fn entry_filter(
 pub(in crate::ui) fn entry_icon(entry: &FileEntry) -> &'static str {
     if entry.is_broken_symbolic_link() {
         return crate::assets::icons::X;
+    }
+    if entry.is_locked_folder() {
+        return crate::assets::icons::FOLDER_LOCK;
     }
     if entry.is_directory() {
         return crate::assets::icons::FOLDER;
@@ -229,7 +207,7 @@ pub(in crate::ui) fn icon_for_name(name: &str) -> &'static str {
         ) => crate::assets::icons::PICTURES,
         Some(
             "mp4" | "mkv" | "webm" | "mov" | "avi" | "m4v" | "mpeg" | "mpg" | "ogv" | "3gp" | "3g2"
-            | "flv" | "wmv" | "asf" | "m2ts" | "vob",
+            | "flv" | "wmv" | "asf" | "m2ts" | "vob" | "h264" | "264" | "h265" | "265" | "hevc",
         ) => crate::assets::icons::VIDEOS,
         Some("mp3" | "wav" | "flac" | "ogg" | "m4a" | "aac" | "opus" | "wma" | "aiff") => {
             crate::assets::icons::FILE_AUDIO
@@ -245,8 +223,8 @@ pub(in crate::ui) fn icon_for_name(name: &str) -> &'static str {
             | "smarty" | "tpl",
         ) => catppuccin::HTML,
         Some(
-            "zip" | "7z" | "tar" | "gz" | "tgz" | "bz2" | "xz" | "zst" | "rar" | "lz" | "lzma"
-            | "lzo" | "rz" | "sz" | "cab" | "arj" | "cpio",
+            "zip" | "7z" | "tar" | "gz" | "tgz" | "tbz" | "tbz2" | "txz" | "tzst" | "bz2" | "xz"
+            | "zst" | "rar" | "lz" | "lzma" | "lzo" | "rz" | "sz" | "cab" | "arj" | "cpio",
         ) => crate::assets::icons::FILE_ARCHIVE,
         Some(
             "deb" | "rpm" | "pkg" | "appimage" | "msi" | "exe" | "apk" | "jar" | "war" | "ear"

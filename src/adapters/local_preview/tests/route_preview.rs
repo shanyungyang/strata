@@ -28,11 +28,13 @@ fn route_requests_bypass_text_and_cache_by_palette() {
         kind: EntryKind::File,
         size: MetadataValue::Unknown,
         modified_unix_seconds: MetadataValue::Known(1),
+        created_unix_seconds: MetadataValue::Unknown,
         mode: MetadataValue::Unknown,
         recent_unix_seconds: MetadataValue::Unknown,
         image_dimensions: MetadataValue::Unknown,
         child_count: MetadataValue::Unknown,
         duration_seconds: MetadataValue::Unknown,
+        listable: MetadataValue::Unknown,
         is_hidden: false,
         recent_uri: None,
     };

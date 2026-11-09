@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: MIT
 
 use super::*;
+use crate::test_support::PrivateContext;
 use crate::ui::browser::{BrowserView, PeekBehavior};
 
 use std::{
@@ -93,12 +94,14 @@ fn trashed_entry(root: &Path, name: &str, original: &Path) -> (FileEntry, PathBu
             kind: crate::model::EntryKind::File,
             size: crate::model::MetadataValue::Unknown,
             modified_unix_seconds: crate::model::MetadataValue::Unknown,
+            created_unix_seconds: crate::model::MetadataValue::Unknown,
             recent_unix_seconds: crate::model::MetadataValue::Unknown,
             is_hidden: false,
             mode: crate::model::MetadataValue::Unknown,
             image_dimensions: crate::model::MetadataValue::Unknown,
             child_count: crate::model::MetadataValue::Unknown,
             duration_seconds: crate::model::MetadataValue::Unknown,
+            listable: crate::model::MetadataValue::Unknown,
             recent_uri: None,
         },
         info,
@@ -136,6 +139,7 @@ fn deletion_reach_keeps_the_local_warning_unless_every_item_is_remote() {
                 (&["/mnt/cloud/a"][..], Remote),
                 (&["/mnt/nas/a", "/mnt/cloud/b"], Remote),
                 (&["sftp://host/a"], Remote),
+                (&["admin:///srv/a"], Local),
                 (&["/home/user/a"], Local),
                 (&["/media/usb/a"], Local),
                 (&["/mnt/pool/a"], Local),
@@ -450,8 +454,57 @@ fn unsupported_trash_fallback_explains_and_focuses_cancel() {
     );
 }
 
+#[test]
+fn a_cancelled_confirmation_gives_back_the_cursor_a_completion_took_meanwhile() {
+    crate::test_support::gtk_test(
+        "ui::browser::trash::tests::a_cancelled_confirmation_gives_back_the_cursor_a_completion_took_meanwhile",
+        || {
+            let fixture = tempfile::tempdir().expect("fixture");
+            for name in ["a.txt", "b.txt", "c.zip", ".hidden.txt"] {
+                fs::write(fixture.path().join(name), b"keep").expect("fixture file");
+            }
+            let [asked, archive, hidden] = ["b.txt", "c.zip", ".hidden.txt"]
+                .map(|name| Location::local(fixture.path().join(name)));
+            let view = view();
+            let window = window(&view);
+            let browser = view.browser();
+            browser.navigate(Location::local(fixture.path()));
+            wait_until(|| browser.select_entries_by_location_at(0, std::slice::from_ref(&asked)));
+            let focused = || browser.focused_entry().map(|entry| entry.location);
+            assert!(!browser.preferences().show_hidden, "precondition");
+
+            let asked_about = browser
+                .focused_entry()
+                .into_iter()
+                .chain([crate::test_support::operations::entry(hidden)])
+                .collect();
+            view.state.show_delete_confirmation(asked_about);
+            assert!(browser.select_entries_by_location_at(0, std::slice::from_ref(&archive)));
+            assert!(modal_key(&window, gtk::gdk::Key::Escape));
+            wait_until(|| {
+                find_widget(window.upcast_ref(), &|widget: &gtk::Widget| {
+                    widget.has_css_class("app-modal-layer")
+                })
+                .is_none()
+            });
+
+            let selected = browser
+                .selected_entries()
+                .into_iter()
+                .map(|entry| entry.location)
+                .collect::<Vec<_>>();
+            assert_eq!(
+                (focused(), selected, browser.preferences().show_hidden),
+                (Some(asked.clone()), vec![asked], false)
+            );
+            window.destroy();
+            browser.clear_observer();
+        },
+    );
+}
+
 fn followed_file_symlink(link: &Path) -> FileEntry {
-    let mut entry = glib::MainContext::new()
+    let mut entry = PrivateContext::new()
         .block_on(crate::adapters::query_file_entry(Location::local(link)))
         .expect("symlink entry");
     assert_eq!(entry.kind, EntryKind::FileSymbolicLink);
@@ -551,6 +604,45 @@ fn missing_file_link_marks_the_delete_total_incomplete() {
 }
 
 #[test]
+fn delete_as_administrator_confirms_permanent_deletion_without_trying_trash() {
+    crate::test_support::gtk_test(
+        "ui::browser::trash::tests::delete_as_administrator_confirms_permanent_deletion_without_trying_trash",
+        || {
+            let entries: Vec<FileEntry> = ["a.txt", "b.txt"]
+                .map(|name| {
+                    crate::test_support::operations::entry(Location::uri(format!(
+                        "admin:///srv/backups/{name}"
+                    )))
+                })
+                .to_vec();
+            let held = Rc::new(crate::test_support::operations::HeldOperations::default());
+            let view = view();
+            view.set_operation_provider(held.clone());
+            let window = window(&view);
+
+            view.state.request_delete(entries, false);
+
+            wait_until(|| button(window.upcast_ref(), "Permanently delete 2 items").is_some());
+            wait_until(|| focused_button_label(&window).as_deref() == Some("Cancel"));
+            assert!(
+                held.delete_requests.borrow().is_empty(),
+                "Delete never attempts Trash as administrator"
+            );
+            assert!(has_label(
+                &window,
+                "Trash isn't available when browsing as administrator."
+            ));
+            assert!(has_label(
+                &window,
+                "These items will be permanently deleted. This action cannot be undone."
+            ));
+            window.destroy();
+            view.browser().clear_observer();
+        },
+    );
+}
+
+#[test]
 fn permanent_delete_symlink_to_folder_counts_only_link_and_labels_folder_link() {
     crate::test_support::gtk_test(
         "ui::browser::trash::tests::permanent_delete_symlink_to_folder_counts_only_link_and_labels_folder_link",
@@ -564,7 +656,7 @@ fn permanent_delete_symlink_to_folder_counts_only_link_and_labels_folder_link() 
             let link = fixture.path().join("0dirlink");
             std::os::unix::fs::symlink(&real_dir, &link).expect("symlink");
 
-            let context = glib::MainContext::new();
+            let context = PrivateContext::new();
             let entry = context
                 .block_on(crate::adapters::query_file_entry(Location::local(&link)))
                 .expect("entry");

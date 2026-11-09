@@ -12,6 +12,7 @@ use crate::{
     },
     step_tests::{
         a_flag_keeps_whether_a_predicate_held_and_always_runs,
+        a_heif_family_output_must_carry_its_iso_bmff_brand,
         a_numbered_tree_expands_like_the_python_comprehension,
         a_run_keeps_its_own_mode_steps_and_rejects_a_malformed_one,
         a_slice_keeps_the_middle_band_or_one_name_of_a_noted_list,
@@ -28,6 +29,7 @@ use crate::{
         notes_stand_in_for_what_a_run_reads_and_unknown_variables_are_rejected,
         only_a_controller_panic_is_filed_as_a_harness_error,
         peer_restart_and_guard_steps_check_their_shape_before_the_run,
+        prefs_write_nested_tables_into_settings_toml,
         remove_and_rename_act_only_inside_the_run_directories,
         waiting_for_exit_wakes_on_the_exit_and_gives_up_at_the_timeout,
     },
@@ -59,6 +61,7 @@ unit_tests! {
     log_proc_and_each_steps_check_their_shape_before_the_run,
     peer_restart_and_guard_steps_check_their_shape_before_the_run,
     glob_and_zipcrypto_helpers_match_names_and_write_archives,
+    a_heif_family_output_must_carry_its_iso_bmff_brand,
     baseline_comparison_thresholds_pixels_and_budget,
     baseline_mismatches_fail_and_only_an_update_writes_the_baseline,
     fixture_roots_and_baseline_steps_check_their_shape_before_the_run,
@@ -68,5 +71,6 @@ unit_tests! {
     a_quality_rates_four_axes_and_its_score_follows_the_rubric,
     the_harness_starts_costly_runs_first_and_names_select_whole_scenarios,
     waiting_for_exit_wakes_on_the_exit_and_gives_up_at_the_timeout,
+    prefs_write_nested_tables_into_settings_toml,
     no_test_attribute_hides_a_runner_test,
 }

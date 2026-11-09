@@ -16,6 +16,14 @@ fn main() {
     println!("cargo::rerun-if-env-changed=STRATA_TRUSTED_COMMAND_PATH");
     validate_trusted_command_path();
 
+    println!("cargo::rustc-check-cfg=cfg(strata_updater_disabled)");
+    println!("cargo::rerun-if-env-changed=STRATA_UPDATER");
+    configure_updater();
+
+    println!("cargo::rustc-check-cfg=cfg(strata_integrations_package)");
+    println!("cargo::rerun-if-env-changed=STRATA_INTEGRATIONS");
+    configure_integrations();
+
     println!("cargo::rerun-if-env-changed=STRATA_BUILD_COMMIT");
     track_git_metadata();
 
@@ -48,6 +56,33 @@ fn main() {
         })
         .unwrap_or_else(|| "stable".to_owned());
     println!("cargo::rustc-env=STRATA_BUILD_KIND={build_kind}");
+}
+
+/// Distribution packages set `STRATA_UPDATER=disabled` so their package manager
+/// owns updates. Any other value is rejected rather than shipping an updater by accident.
+fn configure_updater() {
+    let Some(value) = env::var_os("STRATA_UPDATER") else {
+        return;
+    };
+    match value.to_str().map(str::trim) {
+        Some("" | "enabled") => {}
+        Some("disabled") => println!("cargo::rustc-cfg=strata_updater_disabled"),
+        _ => panic!("STRATA_UPDATER must be \"enabled\" or \"disabled\", not {value:?}"),
+    }
+}
+
+/// Store-based packages (Nix, Guix) set `STRATA_INTEGRATIONS=package` because every
+/// path the runtime installers would record changes on update. The package ships the
+/// portal, D-Bus service, and udiskie files instead.
+fn configure_integrations() {
+    let Some(value) = env::var_os("STRATA_INTEGRATIONS") else {
+        return;
+    };
+    match value.to_str().map(str::trim) {
+        Some("" | "runtime") => {}
+        Some("package") => println!("cargo::rustc-cfg=strata_integrations_package"),
+        _ => panic!("STRATA_INTEGRATIONS must be \"runtime\" or \"package\", not {value:?}"),
+    }
 }
 
 /// Extra host helper directories are embedded verbatim, so a relative or empty

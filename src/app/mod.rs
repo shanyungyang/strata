@@ -10,5 +10,5 @@ pub use browser::{
 };
 pub(crate) use browser::{folder_destination_texts, trash_destination_texts};
 pub(crate) use navigation::{
-    EntryInsertion, EntrySplice, FolderSortResolver, compare_display_names,
+    EntryInsertion, EntrySplice, FolderSortResolver, compare_display_names, compare_type_groups,
 };

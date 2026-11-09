@@ -132,6 +132,57 @@ fn non_recent_locations_are_not_mistaken_for_the_collection() {
 }
 
 #[test]
+fn native_folders_reopen_through_admin_with_their_path_escaped() {
+    use std::os::unix::ffi::OsStrExt;
+
+    for (path, uri) in [
+        (
+            std::ffi::OsStr::new("/run/media/user/drive/backups"),
+            "admin:///run/media/user/drive/backups",
+        ),
+        (
+            std::ffi::OsStr::new("/run/media/user/Photos RAW/100%"),
+            "admin:///run/media/user/Photos%20RAW/100%25",
+        ),
+        (
+            std::ffi::OsStr::from_bytes(b"/srv/caf\xe9"),
+            "admin:///srv/caf%E9",
+        ),
+    ] {
+        let administrator = Location::local(path).as_administrator().expect(uri);
+        assert_eq!(administrator.uri_value(), Some(uri));
+        assert!(administrator.is_administrator());
+        assert!(!Location::local(path).is_administrator());
+    }
+    for location in [
+        Location::local("relative/backups"),
+        Location::uri("sftp://host/backups"),
+        Location::uri("admin:///backups"),
+    ] {
+        assert_eq!(location.as_administrator(), None, "{location:?}");
+    }
+}
+
+#[test]
+fn admin_locations_walk_up_to_a_named_administrator_root() {
+    let backups = Location::uri("admin:///run/media/user/backups");
+
+    assert_eq!(
+        backups.breadcrumbs(),
+        [
+            "admin:///",
+            "admin:///run",
+            "admin:///run/media",
+            "admin:///run/media/user",
+            "admin:///run/media/user/backups",
+        ]
+        .map(Location::uri)
+    );
+    assert_eq!(Location::uri("admin:///").display_name(), "Administrator");
+    assert_eq!(backups.display_name(), "backups");
+}
+
+#[test]
 fn uri_display_names_are_percent_decoded() {
     assert_eq!(
         Location::uri("smb://server/share/My%20Share").display_name(),
@@ -142,6 +193,29 @@ fn uri_display_names_are_percent_decoded() {
         "café"
     );
     assert_eq!(Location::uri("sftp://host/").display_name(), "host");
+}
+
+/// GVfs reports "/" as the leaf name of a mount root such as an SMB share, so these names
+/// must come from the URI without GIO's help.
+#[test]
+fn mount_roots_without_a_gio_leaf_name_are_named_by_their_decoded_uri() {
+    for (uri, name) in [
+        ("smb://host/My%20Share", "My Share"),
+        ("smb://host/My%20Share/", "My Share"),
+        ("smb://host/%C3%9Cn%C3%AFc%C3%B8d%C3%A9/", "Ünïcødé"),
+        ("smb://user@host:445/share", "share"),
+        ("dav://host/remote.php/dav%20files/", "dav files"),
+        ("sftp://host/served?tok=SECRET#frag", "served"),
+        ("smb://host/", "host"),
+        ("sftp://host/?tok=SECRET", "host"),
+        ("sftp://[::1]:2222/", "::1"),
+        ("mtp://caf%C3%A9_phone/", "café_phone"),
+        ("smb://user@h%C3%B6st:445/", "höst"),
+        ("smb://host/caf%FF", "caf\u{fffd}"),
+        ("smb://host/bad%zz", "bad%zz"),
+    ] {
+        assert_eq!(uri_display_name(uri, None), name, "{uri}");
+    }
 }
 
 #[test]
